@@ -1055,21 +1055,24 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
   max-width:160px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .err-chip.empty{background:transparent;color:var(--text-mute);font-style:italic;padding:2px 0}
 
-/* Column-style heatmap: dates on top with vertical guide lines down through rows. */
-.heatmap.cols{display:grid;gap:0;width:100%;align-items:stretch}
+/* Column-style heatmap: date labels BELOW the cells, with a vertical guide
+   line ABOVE each label that extends up through the row stack so columns
+   read like the user's paint mock-up. */
+.heatmap.cols{display:grid;gap:4px;width:100%;position:relative}
 .heatmap.cols .hrow{display:grid;gap:6px;align-items:center}
-.heatmap.cols .hcell{position:relative;height:24px;border-radius:5px}
-.heatmap.cols .hcell::before{content:"";position:absolute;left:50%;top:-100%;bottom:-100%;
-  width:1px;background:var(--border);z-index:0;transform:translateX(-50%)}
-.heatmap.cols .hcell::after{content:"";position:absolute;inset:0;border-radius:5px;background:inherit;z-index:1}
-.heatmap.cols .hcell{background:transparent}
-.heatmap.cols .hcell .fill{position:absolute;inset:0;border-radius:5px;z-index:2}
-.heatmap.cols .hlabel{font-size:10.5px;color:var(--text-mute);text-align:center;
-  font-variant-numeric:tabular-nums;white-space:nowrap;padding:0 2px;height:18px}
-.heatmap.cols .hrow.head .hlabel{font-weight:600;color:var(--text)}
+.heatmap.cols .hcell{position:relative;height:24px;border-radius:5px;background:transparent}
+.heatmap.cols .hcell .fill{position:absolute;inset:0;border-radius:5px;z-index:1}
 .heatmap.cols .rlabel{font-size:12px;font-weight:600;color:var(--text);
   padding-right:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.heatmap.cols .head-cell-empty{height:18px}
+.heatmap.cols .hlabel{font-size:10.5px;color:var(--text-mute);text-align:center;
+  font-variant-numeric:tabular-nums;white-space:nowrap;padding:14px 2px 0;position:relative}
+/* Tick line going UP from the foot label, sitting between cells visually */
+.heatmap.cols .hrow.foot .hlabel::before{
+  content:"";position:absolute;left:50%;bottom:100%;transform:translateX(-50%);
+  width:1px;height:10px;background:var(--text-mute);opacity:.6;
+}
+.heatmap.cols .hrow.foot{margin-top:2px}
+.heatmap.cols .empty-slot{height:1px}
 
 /* Dark mode */
 body.dark{
@@ -1438,13 +1441,13 @@ table.data tbody tr:last-child td{border-bottom:none}
       <section class="charts">
         <div class="card chart-card">
           <div class="chart-head">
-            <h3>Sensor Anomaly Trend <span class="info" title="Mean anomaly ratio (%) per time bucket">ⓘ</span></h3>
+            <h3 data-i18n="sensorTrend">Sensor Anomaly Trend</h3>
             <select class="select" id="anomalyRobotSelect"><option value="">All Robots</option></select>
           </div>
           <div class="chart-body"><canvas id="anomalyChart"></canvas></div>
         </div>
         <div class="card chart-card">
-          <div class="chart-head"><h3>Fault Distribution <span class="info" title="Top 5 error_type categories">ⓘ</span></h3></div>
+          <div class="chart-head"><h3 data-i18n="faultDist">Fault Distribution</h3></div>
           <div class="chart-body donut-wrap">
             <canvas id="faultChart"></canvas>
             <ul class="legend" id="faultLegend"></ul>
@@ -1498,16 +1501,16 @@ table.data tbody tr:last-child td{border-bottom:none}
 
       <div class="card" style="margin-bottom:18px">
         <div class="chart-head">
-          <h3>Fault Frequency Over Time (Last 6 Months) <span class="info" title="Monthly fault counts grouped by component category">ⓘ</span></h3>
+          <h3 data-i18n="faultFreq">Fault Frequency Over Time (Last 6 Months)</h3>
         </div>
         <div style="display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center">
           <div class="bar-chart-wrap"><canvas id="freqChart"></canvas></div>
           <ul class="cat-legend">
-            <li><span class="dot" style="background:var(--cat-brush)"></span>Brush Motor Issues</li>
-            <li><span class="dot" style="background:var(--cat-battery)"></span>Battery &amp; Power</li>
-            <li><span class="dot" style="background:var(--cat-nav)"></span>Navigation System</li>
-            <li><span class="dot" style="background:var(--cat-vacuum)"></span>Vacuum System</li>
-            <li><span class="dot" style="background:var(--cat-other)"></span>Other</li>
+            <li><span class="dot" style="background:var(--cat-brush)"></span><span data-i18n="catBrush">Brush Motor Issues</span></li>
+            <li><span class="dot" style="background:var(--cat-battery)"></span><span data-i18n="catBattery">Battery &amp; Power</span></li>
+            <li><span class="dot" style="background:var(--cat-nav)"></span><span data-i18n="catNav">Navigation System</span></li>
+            <li><span class="dot" style="background:var(--cat-vacuum)"></span><span data-i18n="catVacuum">Vacuum System</span></li>
+            <li><span class="dot" style="background:var(--cat-other)"></span><span data-i18n="catOther">Other</span></li>
           </ul>
         </div>
       </div>
@@ -1515,7 +1518,7 @@ table.data tbody tr:last-child td{border-bottom:none}
       <div class="filter-row">
         <div class="search" style="flex:1;min-width:180px">
           <span class="search-icon">🔎</span>
-          <input type="search" id="fhSearch" placeholder="Search faults..." />
+          <input type="search" id="fhSearch" placeholder="Search faults..." data-i18n-ph="searchFaults" />
         </div>
         <select class="select" id="fhRobotFilter"></select>
         <select class="select" id="fhFaultFilter"></select>
@@ -1523,16 +1526,20 @@ table.data tbody tr:last-child td{border-bottom:none}
         <input class="input-date" type="date" id="fhStartDate" />
         <span class="arrow">→</span>
         <input class="input-date" type="date" id="fhEndDate" />
-        <button class="btn-ghost" onclick="clearFhFilters()">↻ Clear Filters</button>
+        <button class="btn-ghost" onclick="clearFhFilters()">↻ <span data-i18n="clearFilters">Clear Filters</span></button>
       </div>
 
       <section class="card table-card">
         <div class="table-wrap">
           <table class="data">
             <thead><tr>
-              <th>Date &amp; Time</th><th>Robot ID</th><th>Fault Type</th>
-              <th>Diagnosed Issue (From Logs)</th><th>Downtime Duration</th>
-              <th>Resolution Status</th><th class="action-col">Actions</th>
+              <th data-i18n="fhColDateTime">Date &amp; Time</th>
+              <th data-i18n="fhColRobotId">Robot ID</th>
+              <th data-i18n="fhColFaultType">Fault Type</th>
+              <th data-i18n="fhColDiagnosed">Diagnosed Issue (From Logs)</th>
+              <th data-i18n="fhColDowntime">Downtime Duration</th>
+              <th data-i18n="fhColResolution">Resolution Status</th>
+              <th class="action-col" data-i18n="fhColActions">Actions</th>
             </tr></thead>
             <tbody id="fhTableBody"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
           </table>
@@ -1582,10 +1589,10 @@ table.data tbody tr:last-child td{border-bottom:none}
           <div class="chart-head">
             <h3 data-i18n="componentDegradation">Component Degradation Over Time</h3>
             <select class="select" id="degrCategoryFilter">
-              <option>Brush Motor Issues</option>
-              <option>Battery &amp; Power</option>
-              <option>Navigation System</option>
-              <option>Vacuum System</option>
+              <option value="Brush Motor Issues">Brush Motor Issues</option>
+              <option value="Battery &amp; Power">Battery &amp; Power</option>
+              <option value="Navigation System">Navigation System</option>
+              <option value="Vacuum System">Vacuum System</option>
             </select>
           </div>
           <div class="degr-single">
@@ -1648,26 +1655,26 @@ table.data tbody tr:last-child td{border-bottom:none}
 
 <!-- Date range popover (single global instance, repositioned per page) -->
 <div class="popover" id="datePopover" hidden onclick="event.stopPropagation()">
-  <h4>Select Date Range</h4>
+  <h4 data-i18n="selectRange">Select Date Range</h4>
   <div class="quick">
-    <button onclick="applyQuickRange(7)">Last 7 days</button>
-    <button onclick="applyQuickRange(30)">Last 30 days</button>
-    <button onclick="applyQuickRange(90)">Last 90 days</button>
-    <button onclick="applyQuickRange('all')">All time</button>
+    <button onclick="applyQuickRange(7)" data-i18n="last7">Last 7 days</button>
+    <button onclick="applyQuickRange(30)" data-i18n="last30">Last 30 days</button>
+    <button onclick="applyQuickRange(90)" data-i18n="last90">Last 90 days</button>
+    <button onclick="applyQuickRange('all')" data-i18n="allTime">All time</button>
   </div>
-  <div class="row"><label>Start date</label><input type="date" id="rangeStartInput" /></div>
-  <div class="row"><label>End date</label><input type="date" id="rangeEndInput" /></div>
+  <div class="row"><label data-i18n="startDate">Start date</label><input type="date" id="rangeStartInput" /></div>
+  <div class="row"><label data-i18n="endDate">End date</label><input type="date" id="rangeEndInput" /></div>
   <div class="actions">
-    <button onclick="resetRange()">Reset</button>
-    <button class="primary" onclick="applyRange()">Apply</button>
+    <button onclick="resetRange()" data-i18n="reset">Reset</button>
+    <button class="primary" onclick="applyRange()" data-i18n="apply">Apply</button>
   </div>
 </div>
 
 <!-- Notifications panel -->
 <div class="notif-panel" id="notifPanel" hidden onclick="event.stopPropagation()">
   <div class="notif-head">
-    <h4>Notifications</h4>
-    <button class="clear" onclick="markAllRead()">Mark all read</button>
+    <h4 data-i18n="notifications">Notifications</h4>
+    <button class="clear" onclick="markAllRead()" data-i18n="markAllRead">Mark all read</button>
   </div>
   <ul class="notif-list" id="notifList"><li class="notif-empty">Loading…</li></ul>
 </div>
@@ -1703,6 +1710,16 @@ const I18N = {
     riskCritical:"Critical Risk", riskHigh:"High Risk", riskMedium:"Medium Risk", riskLow:"Low Risk",
     allRobots:"All Robots", allComponents:"All Components", allStatuses:"All Statuses", allFaultTypes:"All Fault Types",
     last7Days:"Last 7 Days", last30Days:"Last 30 Days", last90Days:"Last 90 Days",
+    totalFaults:"Total Faults", ofNRobots:"of {0} total robots",
+    showingNofM:"Showing {0} to {1} of {2} {3}",
+    sensorTrend:"Sensor Anomaly Trend", faultDist:"Fault Distribution", faultFreq:"Fault Frequency Over Time (Last 6 Months)",
+    fhColDateTime:"Date & Time", fhColRobotId:"Robot ID", fhColFaultType:"Fault Type",
+    fhColDiagnosed:"Diagnosed Issue (From Logs)", fhColDowntime:"Downtime Duration",
+    fhColResolution:"Resolution Status", fhColActions:"Actions",
+    clearFilters:"Clear Filters",
+    catBrush:"Brush Motor Issues", catBattery:"Battery & Power",
+    catNav:"Navigation System", catVacuum:"Vacuum System", catOther:"Other",
+    resolved:"Resolved", inProgress:"In Progress",
   },
   tr: {
     navDashboard: "Gösterge Paneli", navPredictions: "Tahminler & Analiz", navFaultHistory: "Arıza Geçmişi",
@@ -1732,11 +1749,23 @@ const I18N = {
     riskCritical:"Kritik Risk", riskHigh:"Yüksek Risk", riskMedium:"Orta Risk", riskLow:"Düşük Risk",
     allRobots:"Tüm Robotlar", allComponents:"Tüm Bileşenler", allStatuses:"Tüm Durumlar", allFaultTypes:"Tüm Arıza Tipleri",
     last7Days:"Son 7 Gün", last30Days:"Son 30 Gün", last90Days:"Son 90 Gün",
+    totalFaults:"Toplam Arıza", ofNRobots:"toplam {0} robottan",
+    showingNofM:"{2} {3}, {0}-{1} arası gösteriliyor",
+    sensorTrend:"Sensör Anomali Trendi", faultDist:"Arıza Dağılımı", faultFreq:"Zaman İçinde Arıza Sıklığı (Son 6 Ay)",
+    fhColDateTime:"Tarih & Saat", fhColRobotId:"Robot ID", fhColFaultType:"Arıza Tipi",
+    fhColDiagnosed:"Teşhis Edilen Sorun (Loglardan)", fhColDowntime:"Duraklama Süresi",
+    fhColResolution:"Çözüm Durumu", fhColActions:"İşlemler",
+    clearFilters:"Filtreleri Temizle",
+    catBrush:"Fırça/Motor Sorunları", catBattery:"Pil & Güç",
+    catNav:"Navigasyon Sistemi", catVacuum:"Süpürge/Temizlik", catOther:"Diğer",
+    resolved:"Çözüldü", inProgress:"Devam Ediyor",
   }
 };
 let currentLang = localStorage.getItem("lang") || "en";
 let currentTheme = localStorage.getItem("theme") || "light";
 function t(key){ return (I18N[currentLang] && I18N[currentLang][key]) || I18N.en[key] || key; }
+function tf(key, ...args){ return t(key).replace(/\{(\d+)\}/g, (_, i) => args[i] ?? ""); }
+function locale(){ return currentLang === "tr" ? "tr-TR" : "en-US"; }
 function applyLanguage(lang){
   currentLang = (I18N[lang] ? lang : "en");
   localStorage.setItem("lang", currentLang);
@@ -1744,16 +1773,23 @@ function applyLanguage(lang){
   document.querySelectorAll("[data-i18n]").forEach(el => { el.textContent = t(el.dataset.i18n); });
   document.querySelectorAll("[data-i18n-ph]").forEach(el => { el.placeholder = t(el.dataset.i18nPh); });
   document.querySelectorAll(".seg-btn[data-lang]").forEach(b => b.classList.toggle("active", b.dataset.lang === currentLang));
-  // Translate dropdown options whose values are fixed sentinel strings
-  const optMap = {
-    "All Robots":"allRobots","Tüm Robotlar":"allRobots",
-    "All Components":"allComponents","Tüm Bileşenler":"allComponents",
-    "All Statuses":"allStatuses","Tüm Durumlar":"allStatuses",
-    "All Fault Types":"allFaultTypes","Tüm Arıza Tipleri":"allFaultTypes",
-  };
-  document.querySelectorAll("select option").forEach(opt => {
-    const key = optMap[opt.value] || optMap[opt.textContent];
-    if (key) opt.textContent = t(key);
+  // Translate the sentinel ("All XXX") dropdown options. Only options whose
+  // value attribute is "" are touched -- real robot IDs / fault names keep
+  // their literal text.
+  const sentinelMap = [
+    ["statusFilter", "allStatuses"],
+    ["fhStatusFilter", "allStatuses"],
+    ["faultFilter", "allFaultTypes"],
+    ["fhFaultFilter", "allFaultTypes"],
+    ["fhRobotFilter", "allRobots"],
+    ["predRobotFilter", "allRobots"],
+    ["predCategoryFilter", "allComponents"],
+  ];
+  sentinelMap.forEach(([id, key]) => {
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    const sentinel = sel.querySelector('option[value=""]');
+    if (sentinel) sentinel.textContent = t(key);
   });
   // Time window dropdown has numeric values; translate by value attribute
   const wf = document.getElementById("predWindowFilter");
@@ -1764,6 +1800,19 @@ function applyLanguage(lang){
       if (o.value === "90") o.textContent = t("last90Days");
     });
   }
+  // Category option labels (Brush Motor Issues / Battery & Power / ...)
+  const catKeyMap = {
+    "Brush Motor Issues":"catBrush","Battery & Power":"catBattery",
+    "Navigation System":"catNav","Vacuum System":"catVacuum","Other":"catOther",
+  };
+  ["degrCategoryFilter","predCategoryFilter"].forEach(id=>{
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    [...sel.options].forEach(o=>{
+      const k = catKeyMap[o.value];
+      if (k) o.textContent = t(k);
+    });
+  });
 }
 function setLanguage(lang){ applyLanguage(lang); reloadCurrentPage(); refreshNotificationBadge(); }
 function applyTheme(theme){
@@ -1850,7 +1899,7 @@ async function loadDashboard(){
 async function loadStats(){
   try{
     const d = await fetchJson(`/api/stats${rangeQuery()}`);
-    setStatCard("active", d.active_robots, `of ${d.active_robots.total} total robots`);
+    setStatCard("active", d.active_robots, tf("ofNRobots", d.active_robots.total));
     setStatCard("critical", d.critical_alerts, "robots require attention");
     setStatCard("fleet", d.fleet_health, "healthy robots", true);
     if (d.range?.start && d.range?.end){
@@ -1897,7 +1946,7 @@ function renderTrend(elId, delta){
   const arrow = d>0 ? "↑" : d<0 ? "↓" : "→";
   const cls = d>0 ? "badge-up" : d<0 ? "badge-down" : "badge-flat";
   document.getElementById(elId).innerHTML =
-    `<span class="badge ${cls}">${arrow} ${Math.abs(d).toFixed(1)}%</span><span class="trend-sub">vs prev period</span>`;
+    `<span class="badge ${cls}">${arrow} ${Math.abs(d).toFixed(1)}%</span><span class="trend-sub">${t("vsPrev")}</span>`;
 }
 
 async function loadAnomalyTrend(robotId=null){
@@ -1948,7 +1997,7 @@ function renderFaultDonut({items, total}){
       ctx.textAlign="center"; ctx.textBaseline="middle";
       ctx.fillText(total.toLocaleString(), cx, cy-8);
       ctx.fillStyle="#94a3b8"; ctx.font="500 11px Inter, sans-serif";
-      ctx.fillText("Total Faults", cx, cy+12);
+      ctx.fillText(t("totalFaults"), cx, cy+12);
       ctx.restore();
     }}],
   });
@@ -1958,17 +2007,28 @@ function renderFaultDonut({items, total}){
 }
 
 let filterOptionsLoaded = false;
+// Build <option> markup. The FIRST item is treated as a sentinel ("All XXX")
+// and given value="" so applyLanguage can rewrite its textContent without
+// changing the filter value the backend sees. The other options get an
+// explicit value attribute too so applyLanguage may translate the displayed
+// text (e.g. category names) without disturbing the backend filter key.
+function asOptions(items){
+  return items.map((s,i)=>{
+    const v = i===0 ? "" : s;
+    return `<option value="${escapeAttr(v)}">${escapeHtml(s)}</option>`;
+  }).join("");
+}
 async function loadFilterOptions(){
   if (filterOptionsLoaded){ applyLanguage(currentLang); return; }
   try{
     const d = await fetchJson("/api/filter-options");
-    document.getElementById("statusFilter").innerHTML = d.statuses.map(s=>`<option>${s}</option>`).join("");
-    document.getElementById("faultFilter").innerHTML = d.fault_types.map(s=>`<option>${s}</option>`).join("");
-    document.getElementById("fhRobotFilter").innerHTML = d.robots.map(s=>`<option>${s}</option>`).join("");
-    document.getElementById("fhFaultFilter").innerHTML = d.fault_types.map(s=>`<option>${s}</option>`).join("");
-    document.getElementById("fhStatusFilter").innerHTML = d.statuses.map(s=>`<option>${s}</option>`).join("");
-    document.getElementById("predRobotFilter").innerHTML = d.robots.map(s=>`<option>${s}</option>`).join("");
-    document.getElementById("predCategoryFilter").innerHTML = d.categories.map(s=>`<option>${s}</option>`).join("");
+    document.getElementById("statusFilter").innerHTML    = asOptions(d.statuses);
+    document.getElementById("faultFilter").innerHTML     = asOptions(d.fault_types);
+    document.getElementById("fhRobotFilter").innerHTML   = asOptions(d.robots);
+    document.getElementById("fhFaultFilter").innerHTML   = asOptions(d.fault_types);
+    document.getElementById("fhStatusFilter").innerHTML  = asOptions(d.statuses);
+    document.getElementById("predRobotFilter").innerHTML = asOptions(d.robots);
+    document.getElementById("predCategoryFilter").innerHTML = asOptions(d.categories);
     filterOptionsLoaded = true;
     applyLanguage(currentLang); // translate the freshly-injected sentinel options
   }catch(e){ console.error(e); }
@@ -1977,8 +2037,8 @@ async function loadFilterOptions(){
 async function loadRobots(){
   const params = new URLSearchParams({page:state.page, page_size:state.pageSize});
   if (state.search) params.set("search", state.search);
-  if (state.status && state.status!=="All Statuses") params.set("status", state.status);
-  if (state.faultType && state.faultType!=="All Fault Types") params.set("fault_type", state.faultType);
+  if (state.status) params.set("status", state.status);
+  if (state.faultType) params.set("fault_type", state.faultType);
   if (state.range.start) params.set("start_date", state.range.start);
   if (state.range.end)   params.set("end_date", state.range.end);
   try{
@@ -2046,7 +2106,7 @@ async function populateAnomalyRobotSelect(){
     const d = await fetchJson("/api/robots?page=1&page_size=30");
     const ids = [...new Set(d.items.map(r=>r.robot_id))].slice(0,30);
     document.getElementById("anomalyRobotSelect").innerHTML =
-      `<option value="">All Robots</option>` +
+      `<option value="">${escapeHtml(t("allRobots"))}</option>` +
       ids.map(id=>`<option value="${escapeAttr(id)}">${escapeHtml(shortenId(id))}</option>`).join("");
   }catch{}
 }
@@ -2104,9 +2164,9 @@ async function loadFhFrequency(){
 async function loadFhList(){
   const p = new URLSearchParams({page:state.fh.page, page_size:state.fh.pageSize});
   if (state.fh.search) p.set("search", state.fh.search);
-  if (state.fh.robot && state.fh.robot!=="All Robots") p.set("robot", state.fh.robot);
-  if (state.fh.fault_type && state.fh.fault_type!=="All Fault Types") p.set("fault_type", state.fh.fault_type);
-  if (state.fh.status && state.fh.status!=="All Statuses") p.set("status", state.fh.status);
+  if (state.fh.robot) p.set("robot", state.fh.robot);
+  if (state.fh.fault_type) p.set("fault_type", state.fh.fault_type);
+  if (state.fh.status) p.set("status", state.fh.status);
   if (state.fh.start_date) p.set("start_date", state.fh.start_date);
   if (state.fh.end_date) p.set("end_date", state.fh.end_date);
   try{
@@ -2119,23 +2179,29 @@ async function loadFhList(){
   }
 }
 
+const CAT_I18N = {
+  "Brush Motor Issues":"catBrush","Battery & Power":"catBattery",
+  "Navigation System":"catNav","Vacuum System":"catVacuum","Other":"catOther",
+};
 function renderFhTable({items}){
   const body = document.getElementById("fhTableBody");
-  if (!items.length){ body.innerHTML = `<tr><td colspan="7" class="empty">No faults match the filters</td></tr>`; return; }
+  if (!items.length){ body.innerHTML = `<tr><td colspan="7" class="empty">${t("noFaults")}</td></tr>`; return; }
   body.innerHTML = items.map(it=>{
     const catColor = CAT_COLORS[it.category] || "#94a3b8";
     const resCls = it.resolution==="Resolved" ? "resolved" : "in-progress";
+    const resLabel = it.resolution==="Resolved" ? t("resolved") : t("inProgress");
+    const catLabel = t(CAT_I18N[it.category]) || it.category;
     return `
       <tr>
         <td><div style="font-weight:600">${formatDate(it.task_time)}</div>
             <div style="font-size:11.5px;color:var(--text-mute)">${formatTimeOnly(it.task_time)}</div></td>
         <td><div class="robot-id-cell"><div class="robot-thumb">${robotSvg()}</div>
               <div class="robot-id">${escapeHtml(shortenId(it.robot_id))}</div></div></td>
-        <td><span class="cat-dot" style="background:${catColor}"></span>${escapeHtml(it.category)}</td>
+        <td><span class="cat-dot" style="background:${catColor}"></span>${escapeHtml(catLabel)}</td>
         <td><div class="fault-name">${escapeHtml(it.diagnosed_issue)}</div>
             <div class="fault-detail">${escapeHtml(it.fault_type_raw)}</div></td>
         <td>${escapeHtml(it.downtime)}</td>
-        <td><span class="status ${resCls}">${it.resolution}</span></td>
+        <td><span class="status ${resCls}">${escapeHtml(resLabel)}</span></td>
         <td class="action-col">
           <button class="icon-btn" title="View" onclick="openRobotModal('${escapeAttr(it.robot_id)}')">👁</button>
           <button class="icon-btn" title="Download">⬇</button>
@@ -2147,20 +2213,17 @@ function renderFhTable({items}){
 function bindPredictionsUI(){
   document.getElementById("degrCategoryFilter").addEventListener("change", e=>{
     state.pred.category = e.target.value;
-    // keep top filter in sync
     const top = document.getElementById("predCategoryFilter");
     if (top && [...top.options].some(o=>o.value===e.target.value)) top.value = e.target.value;
     loadDegradation(); loadTopFailures();
   });
   document.getElementById("predRobotFilter").addEventListener("change", e=>{
-    state.pred.robot = e.target.value; loadHeatmap(); loadTopFailures();
+    state.pred.robot = e.target.value;  // "" = all
+    loadHeatmap(); loadTopFailures();
   });
   document.getElementById("predCategoryFilter").addEventListener("change", e=>{
     const v = e.target.value;
-    if (v === "All Components" || v === "Tüm Bileşenler"){
-      // "All": don't switch the degradation chart's category, but clear filter on top failures
-      state.pred.category = state.pred.category || "Brush Motor Issues";
-    } else {
+    if (v){  // concrete category chosen
       state.pred.category = v;
       const inner = document.getElementById("degrCategoryFilter");
       if (inner && [...inner.options].some(o=>o.value===v)) inner.value = v;
@@ -2182,22 +2245,17 @@ async function loadHeatmap(){
   try{
     const params = new URLSearchParams();
     if (state.pred.windowDays) params.set("days", state.pred.windowDays);
-    if (state.pred.robot && state.pred.robot !== "All Robots") params.set("robot_id", state.pred.robot);
+    if (state.pred.robot) params.set("robot_id", state.pred.robot);
     const d = await fetchJson(`/api/predictions/heatmap?${params}`);
     const grid = document.getElementById("heatmapGrid");
     if (!d.robot_ids.length || !d.weeks.length){
       grid.innerHTML = `<div class="empty">${t("noRobots")}</div>`; return;
     }
     // Column grid: first column = robot label, remaining N columns = one per week.
-    // Top row holds the date labels; each cell below has a vertical guide line
-    // (the `::before` pseudo-element on .hcell) that visually connects the date
-    // header to the bars below.
+    // Cells render in the top rows; the last row holds the date labels.
+    // Each foot label gets a small tick line going up (::before) so the
+    // columns read like the user's reference mock-up.
     const cols = `120px repeat(${d.weeks.length}, 1fr)`;
-    const headerCells = d.weeks.map(w => `<div class="hlabel">${escapeHtml(w)}</div>`).join("");
-    const header = `<div class="hrow head" style="grid-template-columns:${cols}">
-                      <div class="head-cell-empty"></div>
-                      ${headerCells}
-                    </div>`;
     const rows = d.robot_ids.map((rid,i)=>{
       const cells = d.weeks.map((w, j)=>{
         const v = d.grid[i][j];
@@ -2210,7 +2268,12 @@ async function loadHeatmap(){
                 ${cells}
               </div>`;
     }).join("");
-    grid.innerHTML = header + rows;
+    const footCells = d.weeks.map(w => `<div class="hlabel">${escapeHtml(w)}</div>`).join("");
+    const foot = `<div class="hrow foot" style="grid-template-columns:${cols}">
+                    <div class="empty-slot"></div>
+                    ${footCells}
+                  </div>`;
+    grid.innerHTML = rows + foot;
   }catch(e){ console.error(e); }
 }
 
@@ -2272,9 +2335,9 @@ function setPredCard(valId, trendId, barId, val, delta, barPct){
 async function loadTopFailures(){
   try{
     const params = new URLSearchParams({ days: state.pred.windowDays || 30 });
-    if (state.pred.robot && state.pred.robot !== "All Robots") params.set("robot_id", state.pred.robot);
+    if (state.pred.robot) params.set("robot_id", state.pred.robot);
     const selCat = document.getElementById("predCategoryFilter")?.value;
-    if (selCat && selCat !== "All Components" && selCat !== "Tüm Bileşenler") params.set("category", selCat);
+    if (selCat) params.set("category", selCat);
     const d = await fetchJson(`/api/predictions/top-failures?${params}`);
     const root = document.getElementById("predCardsContainer");
     if (!d.items.length){ root.innerHTML = `<div class="empty">No predictions available</div>`; return; }
@@ -2325,7 +2388,8 @@ function renderPagination(navId, infoId, {total, page, page_size}, onGo, noun){
   const totalPages = Math.max(1, Math.ceil(total/page_size));
   const startN = total===0 ? 0 : (page-1)*page_size + 1;
   const endN = Math.min(total, page*page_size);
-  document.getElementById(infoId).textContent = `Showing ${startN} to ${endN} of ${total} ${noun}`;
+  const nounLabel = t(noun) || noun;
+  document.getElementById(infoId).textContent = tf("showingNofM", startN, endN, total, nounLabel);
   const nav = document.getElementById(navId);
   const html = [`<button ${page===1?"disabled":""} data-go="${page-1}">‹</button>`];
   for (const p of pageWindow(page, totalPages, 5)){
@@ -2485,7 +2549,7 @@ async function loadNotifications(){
     const d = await fetchJson("/api/notifications?limit=20");
     state.notifications.items = d.items;
     updateBellBadge(d.items.length);
-    if (!d.items.length){ list.innerHTML = `<li class="notif-empty">No active alerts</li>`; return; }
+    if (!d.items.length){ list.innerHTML = `<li class="notif-empty">${t("noAlerts")}</li>`; return; }
     list.innerHTML = d.items.map(it=>`
       <li>
         <div class="sev ${it.severity}"></div>
@@ -2552,14 +2616,14 @@ function debounce(fn, ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function escapeAttr(s){ return escapeHtml(s); }
 function shortenId(id){ if (!id) return ""; return id.length>12 ? "RC-"+id.slice(-8) : id; }
-function formatRange(iso){ return new Date(iso).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}); }
-function formatShortDate(iso){ return new Date(iso).toLocaleDateString("en-US",{month:"short",day:"numeric"}); }
+function formatRange(iso){ return new Date(iso).toLocaleDateString(locale(),{month:"short",day:"numeric",year:"numeric"}); }
+function formatShortDate(iso){ return new Date(iso).toLocaleDateString(locale(),{month:"short",day:"numeric"}); }
 function formatLong(iso){ if (!iso) return "—";
-  return new Date(iso).toLocaleString("en-US",{month:"short",day:"numeric",year:"numeric",hour:"2-digit",minute:"2-digit",hour12:false}); }
+  return new Date(iso).toLocaleString(locale(),{month:"short",day:"numeric",year:"numeric",hour:"2-digit",minute:"2-digit",hour12:false}); }
 function formatDate(iso){ if (!iso) return "—";
-  return new Date(iso).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}); }
+  return new Date(iso).toLocaleDateString(locale(),{month:"short",day:"numeric",year:"numeric"}); }
 function formatTimeOnly(iso){ if (!iso) return "";
-  return new Date(iso).toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:false}); }
+  return new Date(iso).toLocaleTimeString(locale(),{hour:"2-digit",minute:"2-digit",hour12:false}); }
 function robotSvg(){
   return `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
     <rect x="4" y="8" width="16" height="11" rx="2"></rect>
