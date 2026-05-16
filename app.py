@@ -649,19 +649,31 @@ def api_fault_list(
 # API: predictions
 # ============================================================================
 @app.get("/api/predictions/heatmap")
-def api_pred_heatmap(weeks: int = Query(8, ge=2, le=52)) -> dict[str, Any]:
+def api_pred_heatmap(
+    weeks: int = Query(8, ge=2, le=52),
+    days: int | None = Query(default=None, ge=1, le=730),
+    robot_id: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Per-robot weekly risk grid. `days` overrides `weeks` when supplied."""
     with get_cursor() as cur:
         _start, end = _data_window(cur)
-        win_start = end - timedelta(weeks=weeks)
-        cur.execute("""
+        if days is not None:
+            win_start = end - timedelta(days=days)
+        else:
+            win_start = end - timedelta(weeks=weeks)
+        params: list[Any] = [win_start, end]
+        sql = """
             SELECT robot_id,
                    date_trunc('week', task_time) AS bkt,
                    AVG(hourly_ratio) AS risk
             FROM public.robot_logs_error
             WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
-            GROUP BY robot_id, bkt
-            ORDER BY robot_id, bkt;
-        """, (win_start, end))
+        """
+        if robot_id and robot_id.lower() not in ("", "all", "all robots"):
+            sql += " AND robot_id = %s"
+            params.append(robot_id)
+        sql += " GROUP BY robot_id, bkt ORDER BY robot_id, bkt;"
+        cur.execute(sql, params)
         rows = cur.fetchall()
         robots: dict[str, dict[str, float]] = {}
         weeks_set: set[str] = set()
@@ -670,7 +682,11 @@ def api_pred_heatmap(weeks: int = Query(8, ge=2, le=52)) -> dict[str, Any]:
             weeks_set.add(label)
             robots.setdefault(r["robot_id"], {})[label] = round(float(r["risk"] or 0) * 100, 1)
         week_labels = sorted(weeks_set, key=lambda s: datetime.strptime(s, "%b %d"))
-        active_robots = sorted(robots.items(), key=lambda kv: -sum(kv[1].values()))[:8]
+        # If a specific robot was requested, show only that robot; otherwise top 8 noisiest
+        if robot_id and robot_id.lower() not in ("", "all", "all robots"):
+            active_robots = list(robots.items())
+        else:
+            active_robots = sorted(robots.items(), key=lambda kv: -sum(kv[1].values()))[:8]
         return {
             "robot_ids": [rid for rid, _ in active_robots],
             "weeks": week_labels,
@@ -730,11 +746,11 @@ def api_pred_degradation(category: str = Query("Brush Motor Issues")) -> dict[st
 
 
 @app.get("/api/predictions/stats")
-def api_pred_stats() -> dict[str, Any]:
+def api_pred_stats(days: int = Query(7, ge=1, le=365)) -> dict[str, Any]:
     with get_cursor() as cur:
         _start, end = _data_window(cur)
-        recent_start = end - timedelta(days=7)
-        prev_start = end - timedelta(days=14)
+        recent_start = end - timedelta(days=days)
+        prev_start = end - timedelta(days=days * 2)
 
         cur.execute("SELECT AVG(hourly_ratio) AS r FROM public.robot_logs_error WHERE task_time BETWEEN %s AND %s;", (recent_start, end))
         ratio_now = float(cur.fetchone()["r"] or 0)
@@ -833,17 +849,26 @@ def api_notifications(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
 
 
 @app.get("/api/predictions/top-failures")
-def api_top_failures() -> dict[str, Any]:
+def api_top_failures(
+    days: int = Query(30, ge=1, le=365),
+    robot_id: str | None = Query(default=None),
+    category: str | None = Query(default=None),
+) -> dict[str, Any]:
     with get_cursor() as cur:
         _start, end = _data_window(cur)
-        recent = end - timedelta(days=30)
-        cur.execute("""
+        recent = end - timedelta(days=days)
+        params: list[Any] = [recent, end]
+        sql = """
             SELECT DISTINCT ON (robot_id)
                    robot_id, product_code, error_type, error_detail, hourly_ratio, task_time
             FROM public.robot_logs_error
             WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
-            ORDER BY robot_id, task_time DESC;
-        """, (recent, end))
+        """
+        if robot_id and robot_id.lower() not in ("", "all", "all robots"):
+            sql += " AND robot_id = %s"
+            params.append(robot_id)
+        sql += " ORDER BY robot_id, task_time DESC;"
+        cur.execute(sql, params)
         rows = cur.fetchall()
         items = []
         for r in rows:
@@ -852,6 +877,9 @@ def api_top_failures() -> dict[str, Any]:
             elif prob >= 60: risk = "High Risk"
             elif prob >= 40: risk = "Medium Risk"
             else: risk = "Low Risk"
+            cat = _category_for_error_type(r["error_type"])
+            if category and category.lower() not in ("", "all", "all components") and cat != category:
+                continue
             items.append({
                 "robot_id": r["robot_id"],
                 "area": r["product_code"] or "Unknown",
@@ -860,7 +888,7 @@ def api_top_failures() -> dict[str, Any]:
                 "predicted_issue": r["error_type"] or "Unknown",
                 "predicted_detail": r["error_detail"] or "Operational",
                 "estimated_time": r["task_time"].isoformat() if r["task_time"] else None,
-                "category": _category_for_error_type(r["error_type"]),
+                "category": cat,
             })
         items.sort(key=lambda x: -x["failure_probability"])
         return {"items": items[:10]}
@@ -1027,12 +1055,21 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
   max-width:160px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .err-chip.empty{background:transparent;color:var(--text-mute);font-style:italic;padding:2px 0}
 
-/* Inline-date heatmap row layout */
-.heatmap.inline .row{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
-.heatmap.inline .rlabel{width:110px;font-weight:600;color:var(--text);font-size:12px}
-.heatmap.inline .dlabel{font-size:10.5px;color:var(--text-mute);padding:0 4px;
-  font-variant-numeric:tabular-nums;white-space:nowrap}
-.heatmap.inline .cell{width:24px;height:24px;border-radius:5px;flex-shrink:0}
+/* Column-style heatmap: dates on top with vertical guide lines down through rows. */
+.heatmap.cols{display:grid;gap:0;width:100%;align-items:stretch}
+.heatmap.cols .hrow{display:grid;gap:6px;align-items:center}
+.heatmap.cols .hcell{position:relative;height:24px;border-radius:5px}
+.heatmap.cols .hcell::before{content:"";position:absolute;left:50%;top:-100%;bottom:-100%;
+  width:1px;background:var(--border);z-index:0;transform:translateX(-50%)}
+.heatmap.cols .hcell::after{content:"";position:absolute;inset:0;border-radius:5px;background:inherit;z-index:1}
+.heatmap.cols .hcell{background:transparent}
+.heatmap.cols .hcell .fill{position:absolute;inset:0;border-radius:5px;z-index:2}
+.heatmap.cols .hlabel{font-size:10.5px;color:var(--text-mute);text-align:center;
+  font-variant-numeric:tabular-nums;white-space:nowrap;padding:0 2px;height:18px}
+.heatmap.cols .hrow.head .hlabel{font-weight:600;color:var(--text)}
+.heatmap.cols .rlabel{font-size:12px;font-weight:600;color:var(--text);
+  padding-right:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.heatmap.cols .head-cell-empty{height:18px}
 
 /* Dark mode */
 body.dark{
@@ -1536,7 +1573,7 @@ table.data tbody tr:last-child td{border-bottom:none}
             <h3 data-i18n="fleetRiskHeatmap">Fleet Risk Assessment Heatmap</h3>
           </div>
           <div style="display:flex;gap:12px;align-items:flex-end">
-            <div class="heatmap inline" id="heatmapGrid" style="flex:1"></div>
+            <div class="heatmap cols" id="heatmapGrid" style="flex:1"></div>
             <div class="heat-legend"><div data-i18n="heatHigh">High</div><div class="bar"></div><div data-i18n="heatLow">Low</div></div>
           </div>
         </div>
@@ -1564,25 +1601,25 @@ table.data tbody tr:last-child td{border-bottom:none}
       <section class="cards" style="grid-template-columns:repeat(4,minmax(0,1fr))">
         <div class="card stat">
           <div class="stat-icon icon-green"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg></div>
-          <div class="stat-body"><div class="stat-title">Average Fleet Health</div><div class="stat-value" id="predFleet">—%</div></div>
+          <div class="stat-body"><div class="stat-title" data-i18n="avgFleetHealth">Average Fleet Health</div><div class="stat-value" id="predFleet">—%</div></div>
           <div class="stat-trend" id="predFleetTrend"></div>
           <div class="stat-bar"><div class="stat-bar-fill green" id="predFleetBar" style="width:0%"></div></div>
         </div>
         <div class="card stat">
           <div class="stat-icon icon-red"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 L22 20 L2 20 Z"></path><path d="M12 9v5"></path><circle cx="12" cy="17" r="1" fill="currentColor"></circle></svg></div>
-          <div class="stat-body"><div class="stat-title">High Risk Robots</div><div class="stat-value" id="predHighRisk">—</div></div>
+          <div class="stat-body"><div class="stat-title" data-i18n="highRiskRobots">High Risk Robots</div><div class="stat-value" id="predHighRisk">—</div></div>
           <div class="stat-trend" id="predHighRiskTrend"></div>
           <div class="stat-bar"><div class="stat-bar-fill red" id="predHighRiskBar" style="width:0%"></div></div>
         </div>
         <div class="card stat">
           <div class="stat-icon icon-blue"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v6l4 2"></path></svg></div>
-          <div class="stat-body"><div class="stat-title">Predicted Failures (48h)</div><div class="stat-value" id="predFail">—</div></div>
+          <div class="stat-body"><div class="stat-title" data-i18n="predFailures">Predicted Failures (48h)</div><div class="stat-value" id="predFail">—</div></div>
           <div class="stat-trend" id="predFailTrend"></div>
           <div class="stat-bar"><div class="stat-bar-fill blue" id="predFailBar" style="width:0%"></div></div>
         </div>
         <div class="card stat">
           <div class="stat-icon icon-purple"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M8 12l2.5 2.5L16 9"></path></svg></div>
-          <div class="stat-body"><div class="stat-title">Model Accuracy</div><div class="stat-value" id="predAcc">—%</div></div>
+          <div class="stat-body"><div class="stat-title" data-i18n="modelAccuracy">Model Accuracy</div><div class="stat-value" id="predAcc">—%</div></div>
           <div class="stat-trend" id="predAccTrend"></div>
           <div class="stat-bar"><div class="stat-bar-fill purple" id="predAccBar" style="width:0%"></div></div>
         </div>
@@ -1590,7 +1627,7 @@ table.data tbody tr:last-child td{border-bottom:none}
 
       <section class="card">
         <div class="chart-head">
-          <h3>Top Failure Predictions (Next 48 Hours) <span class="info" title="Robots with highest predicted failure probability">ⓘ</span></h3>
+          <h3 data-i18n="topFailurePred">Top Failure Predictions (Next 48 Hours)</h3>
         </div>
         <div class="pred-cards" id="predCardsContainer"><div class="empty">Loading…</div></div>
       </section>
@@ -1663,6 +1700,9 @@ const I18N = {
     failureProb: "Failure Probability", predictedIssue: "Predicted Issue", estimatedTime: "Estimated Time", viewDetails: "View Details",
     avgFleetHealth: "Average Fleet Health", highRiskRobots: "High Risk Robots", predFailures: "Predicted Failures (48h)", modelAccuracy: "Model Accuracy",
     topFailurePred: "Top Failure Predictions (Next 48 Hours)",
+    riskCritical:"Critical Risk", riskHigh:"High Risk", riskMedium:"Medium Risk", riskLow:"Low Risk",
+    allRobots:"All Robots", allComponents:"All Components", allStatuses:"All Statuses", allFaultTypes:"All Fault Types",
+    last7Days:"Last 7 Days", last30Days:"Last 30 Days", last90Days:"Last 90 Days",
   },
   tr: {
     navDashboard: "Gösterge Paneli", navPredictions: "Tahminler & Analiz", navFaultHistory: "Arıza Geçmişi",
@@ -1689,6 +1729,9 @@ const I18N = {
     failureProb: "Arıza Olasılığı", predictedIssue: "Tahmin Edilen Sorun", estimatedTime: "Tahmini Zaman", viewDetails: "Detayları Gör",
     avgFleetHealth: "Ortalama Filo Sağlığı", highRiskRobots: "Yüksek Riskli Robotlar", predFailures: "Tahmini Arızalar (48s)", modelAccuracy: "Model Doğruluğu",
     topFailurePred: "En Yüksek Arıza Tahminleri (Sonraki 48 Saat)",
+    riskCritical:"Kritik Risk", riskHigh:"Yüksek Risk", riskMedium:"Orta Risk", riskLow:"Düşük Risk",
+    allRobots:"Tüm Robotlar", allComponents:"Tüm Bileşenler", allStatuses:"Tüm Durumlar", allFaultTypes:"Tüm Arıza Tipleri",
+    last7Days:"Son 7 Gün", last30Days:"Son 30 Gün", last90Days:"Son 90 Gün",
   }
 };
 let currentLang = localStorage.getItem("lang") || "en";
@@ -1701,6 +1744,26 @@ function applyLanguage(lang){
   document.querySelectorAll("[data-i18n]").forEach(el => { el.textContent = t(el.dataset.i18n); });
   document.querySelectorAll("[data-i18n-ph]").forEach(el => { el.placeholder = t(el.dataset.i18nPh); });
   document.querySelectorAll(".seg-btn[data-lang]").forEach(b => b.classList.toggle("active", b.dataset.lang === currentLang));
+  // Translate dropdown options whose values are fixed sentinel strings
+  const optMap = {
+    "All Robots":"allRobots","Tüm Robotlar":"allRobots",
+    "All Components":"allComponents","Tüm Bileşenler":"allComponents",
+    "All Statuses":"allStatuses","Tüm Durumlar":"allStatuses",
+    "All Fault Types":"allFaultTypes","Tüm Arıza Tipleri":"allFaultTypes",
+  };
+  document.querySelectorAll("select option").forEach(opt => {
+    const key = optMap[opt.value] || optMap[opt.textContent];
+    if (key) opt.textContent = t(key);
+  });
+  // Time window dropdown has numeric values; translate by value attribute
+  const wf = document.getElementById("predWindowFilter");
+  if (wf){
+    [...wf.options].forEach(o=>{
+      if (o.value === "7")  o.textContent = t("last7Days");
+      if (o.value === "30") o.textContent = t("last30Days");
+      if (o.value === "90") o.textContent = t("last90Days");
+    });
+  }
 }
 function setLanguage(lang){ applyLanguage(lang); reloadCurrentPage(); refreshNotificationBadge(); }
 function applyTheme(theme){
@@ -1724,7 +1787,7 @@ const CAT_COLORS = {
 const state = {
   page:1, pageSize:5, search:"", status:"All Statuses", faultType:"All Fault Types",
   fh:{page:1, pageSize:8, search:"", robot:"All Robots", fault_type:"All Fault Types", status:"All Statuses", start_date:"", end_date:""},
-  pred:{category:"Brush Motor Issues"},
+  pred:{category:"Brush Motor Issues", robot:"All Robots", windowDays:7},
   // global date filter shared across dashboard/predictions/fault-history
   range:{ start:"", end:"", extentStart:"", extentEnd:"" },
   notifications:{ items:[], dismissedAt:null },
@@ -1894,7 +1957,9 @@ function renderFaultDonut({items, total}){
       <span><span class="value">${it.count}</span> <span class="pct">(${it.pct}%)</span></span></li>`).join("");
 }
 
+let filterOptionsLoaded = false;
 async function loadFilterOptions(){
+  if (filterOptionsLoaded){ applyLanguage(currentLang); return; }
   try{
     const d = await fetchJson("/api/filter-options");
     document.getElementById("statusFilter").innerHTML = d.statuses.map(s=>`<option>${s}</option>`).join("");
@@ -1904,6 +1969,8 @@ async function loadFilterOptions(){
     document.getElementById("fhStatusFilter").innerHTML = d.statuses.map(s=>`<option>${s}</option>`).join("");
     document.getElementById("predRobotFilter").innerHTML = d.robots.map(s=>`<option>${s}</option>`).join("");
     document.getElementById("predCategoryFilter").innerHTML = d.categories.map(s=>`<option>${s}</option>`).join("");
+    filterOptionsLoaded = true;
+    applyLanguage(currentLang); // translate the freshly-injected sentinel options
   }catch(e){ console.error(e); }
 }
 
@@ -2014,7 +2081,7 @@ function clearFhFilters(){
 }
 
 async function loadFaultHistory(){
-  await Promise.all([loadFhFrequency(), loadFhList()]);
+  await Promise.all([loadFilterOptions(), loadFhFrequency(), loadFhList()]);
 }
 
 async function loadFhFrequency(){
@@ -2079,33 +2146,71 @@ function renderFhTable({items}){
 
 function bindPredictionsUI(){
   document.getElementById("degrCategoryFilter").addEventListener("change", e=>{
-    state.pred.category = e.target.value; loadDegradation();
+    state.pred.category = e.target.value;
+    // keep top filter in sync
+    const top = document.getElementById("predCategoryFilter");
+    if (top && [...top.options].some(o=>o.value===e.target.value)) top.value = e.target.value;
+    loadDegradation(); loadTopFailures();
+  });
+  document.getElementById("predRobotFilter").addEventListener("change", e=>{
+    state.pred.robot = e.target.value; loadHeatmap(); loadTopFailures();
+  });
+  document.getElementById("predCategoryFilter").addEventListener("change", e=>{
+    const v = e.target.value;
+    if (v === "All Components" || v === "Tüm Bileşenler"){
+      // "All": don't switch the degradation chart's category, but clear filter on top failures
+      state.pred.category = state.pred.category || "Brush Motor Issues";
+    } else {
+      state.pred.category = v;
+      const inner = document.getElementById("degrCategoryFilter");
+      if (inner && [...inner.options].some(o=>o.value===v)) inner.value = v;
+      loadDegradation();
+    }
+    loadTopFailures();
+  });
+  document.getElementById("predWindowFilter").addEventListener("change", e=>{
+    state.pred.windowDays = parseInt(e.target.value, 10) || 7;
+    loadHeatmap(); loadPredStats(); loadTopFailures();
   });
 }
 
 async function loadPredictions(){
-  await Promise.all([loadHeatmap(), loadDegradation(), loadPredStats(), loadTopFailures()]);
+  await Promise.all([loadFilterOptions(), loadHeatmap(), loadDegradation(), loadPredStats(), loadTopFailures()]);
 }
 
 async function loadHeatmap(){
   try{
-    const d = await fetchJson("/api/predictions/heatmap");
+    const params = new URLSearchParams();
+    if (state.pred.windowDays) params.set("days", state.pred.windowDays);
+    if (state.pred.robot && state.pred.robot !== "All Robots") params.set("robot_id", state.pred.robot);
+    const d = await fetchJson(`/api/predictions/heatmap?${params}`);
     const grid = document.getElementById("heatmapGrid");
-    if (!d.robot_ids.length){ grid.innerHTML = `<div class="empty">No data</div>`; return; }
-    // Inline layout: each row is [robot label] [date1 cell1] [date2 cell2] ...
-    // so the date label sits beside the cell it represents, not stacked below.
+    if (!d.robot_ids.length || !d.weeks.length){
+      grid.innerHTML = `<div class="empty">${t("noRobots")}</div>`; return;
+    }
+    // Column grid: first column = robot label, remaining N columns = one per week.
+    // Top row holds the date labels; each cell below has a vertical guide line
+    // (the `::before` pseudo-element on .hcell) that visually connects the date
+    // header to the bars below.
+    const cols = `120px repeat(${d.weeks.length}, 1fr)`;
+    const headerCells = d.weeks.map(w => `<div class="hlabel">${escapeHtml(w)}</div>`).join("");
+    const header = `<div class="hrow head" style="grid-template-columns:${cols}">
+                      <div class="head-cell-empty"></div>
+                      ${headerCells}
+                    </div>`;
     const rows = d.robot_ids.map((rid,i)=>{
       const cells = d.weeks.map((w, j)=>{
         const v = d.grid[i][j];
-        return `<span class="dlabel">${escapeHtml(w)}</span>
-                <div class="cell" style="background:${riskColor(v)}" title="${escapeAttr(w)}: ${v}%"></div>`;
+        return `<div class="hcell" title="${escapeAttr(w)}: ${v}%">
+                  <span class="fill" style="background:${riskColor(v)}"></span>
+                </div>`;
       }).join("");
-      return `<div class="row">
+      return `<div class="hrow" style="grid-template-columns:${cols}">
                 <div class="rlabel" title="${escapeAttr(rid)}">${escapeHtml(shortenId(rid))}</div>
                 ${cells}
               </div>`;
     }).join("");
-    grid.innerHTML = rows;
+    grid.innerHTML = header + rows;
   }catch(e){ console.error(e); }
 }
 
@@ -2150,7 +2255,7 @@ function renderDegradation(canvasId, badgeId, d, color, useRf){
 
 async function loadPredStats(){
   try{
-    const d = await fetchJson("/api/predictions/stats");
+    const d = await fetchJson(`/api/predictions/stats?days=${state.pred.windowDays || 7}`);
     setPredCard("predFleet","predFleetTrend","predFleetBar", d.fleet_health.value+"%", d.fleet_health.delta_pct, d.fleet_health.value);
     setPredCard("predHighRisk","predHighRiskTrend","predHighRiskBar", d.high_risk.value, d.high_risk.delta_pct, Math.min(100, d.high_risk.value*12));
     setPredCard("predFail","predFailTrend","predFailBar", d.predicted_fail.value, d.predicted_fail.delta_pct, Math.min(100, d.predicted_fail.value*12));
@@ -2166,11 +2271,16 @@ function setPredCard(valId, trendId, barId, val, delta, barPct){
 
 async function loadTopFailures(){
   try{
-    const d = await fetchJson("/api/predictions/top-failures");
+    const params = new URLSearchParams({ days: state.pred.windowDays || 30 });
+    if (state.pred.robot && state.pred.robot !== "All Robots") params.set("robot_id", state.pred.robot);
+    const selCat = document.getElementById("predCategoryFilter")?.value;
+    if (selCat && selCat !== "All Components" && selCat !== "Tüm Bileşenler") params.set("category", selCat);
+    const d = await fetchJson(`/api/predictions/top-failures?${params}`);
     const root = document.getElementById("predCardsContainer");
     if (!d.items.length){ root.innerHTML = `<div class="empty">No predictions available</div>`; return; }
     root.innerHTML = d.items.slice(0,5).map(it=>{
       const rk = it.risk_level.split(" ")[0];
+      const riskLabel = t("risk" + rk) || it.risk_level;
       return `
         <div class="pred-card ${rk}">
           <div class="head">
@@ -2182,12 +2292,12 @@ async function loadTopFailures(){
           </div>
           <div class="prob-row">
             <span class="prob" style="color:${rk==='Critical'?'var(--red)':rk==='High'?'var(--amber)':rk==='Medium'?'#a16207':'var(--green)'}">${it.failure_probability}%</span>
-            <span class="risk-pill ${rk}">${escapeHtml(it.risk_level)}</span>
+            <span class="risk-pill ${rk}">${escapeHtml(riskLabel)}</span>
           </div>
-          <div><div class="label-sm">Failure Probability</div></div>
-          <div><div class="label-sm">Predicted Issue</div><div class="issue">${escapeHtml(it.predicted_issue)}</div></div>
-          <div><div class="label-sm">Estimated Time</div><div class="time">${formatLong(it.estimated_time)}</div></div>
-          <button class="btn-view" onclick="openRobotModal('${escapeAttr(it.robot_id)}')">View Details</button>
+          <div><div class="label-sm">${t("failureProb")}</div></div>
+          <div><div class="label-sm">${t("predictedIssue")}</div><div class="issue">${escapeHtml(it.predicted_issue)}</div></div>
+          <div><div class="label-sm">${t("estimatedTime")}</div><div class="time">${formatLong(it.estimated_time)}</div></div>
+          <button class="btn-view" onclick="openRobotModal('${escapeAttr(it.robot_id)}')">${t("viewDetails")}</button>
         </div>`;
     }).join("");
   }catch(e){ console.error(e); }
