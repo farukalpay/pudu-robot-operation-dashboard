@@ -219,6 +219,33 @@ def _classify_status(error_level: str | None, hourly_ratio: float | None) -> str
     return "Normal"
 
 
+def _status_code(error_level: str | None, prob: float, forecast: float = 0.0) -> str:
+    """DrGb24-style status codes used by the dashboard table & i18n labels.
+
+    FAULTED     = fatal level OR (error level AND prob>=0.8)
+    MAINTENANCE = error level OR prob>=0.55
+    MONITOR     = warning level OR prob>=0.30
+    OPERATIONAL = otherwise
+    """
+    lvl = (error_level or "").lower()
+    if lvl == "fatal" or (lvl == "error" and prob >= 0.8):
+        return "FAULTED"
+    if lvl == "error" or prob >= 0.55:
+        return "MAINTENANCE"
+    if lvl == "warning" or prob >= 0.30:
+        return "MONITOR"
+    return "OPERATIONAL"
+
+
+def _normalize_severity(error_level: str | None) -> str:
+    lvl = (error_level or "").strip().lower()
+    if lvl in ("event", "info"):       return "Event"
+    if lvl == "warning":               return "Warning"
+    if lvl == "error":                 return "Error"
+    if lvl in ("critical", "fatal"):   return "Fatal"
+    return error_level or "Event"
+
+
 def _category_for_error_type(error_type: str | None) -> str:
     et = (error_type or "").lower()
     if any(k in et for k in ("brush", "vacuum", "dust", "drainsewage", "sewage", "mop", "filter", "flow")):
@@ -297,9 +324,21 @@ def api_stats(start_date: str | None = None, end_date: str | None = None) -> dic
         cur.execute("SELECT COUNT(DISTINCT robot_id) AS n FROM public.robot_logs_error WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL;", (start, midpoint))
         active_prev = cur.fetchone()["n"] or 0
 
-        crit_q = """SELECT COUNT(DISTINCT robot_id) AS n FROM public.robot_logs_error
-                    WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
-                      AND (LOWER(COALESCE(error_level,'')) IN ('critical','error','fatal') OR hourly_ratio >= 0.6);"""
+        # Critical = robots whose LATEST log in the window is critical-ish.
+        # (Previous version counted any robot that ever had a critical event in the
+        # whole window, which made fleet health permanently 0% on multi-month ranges.)
+        crit_q = """
+            WITH latest AS (
+                SELECT DISTINCT ON (robot_id) robot_id, error_level, hourly_ratio
+                FROM public.robot_logs_error
+                WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
+                ORDER BY robot_id, task_time DESC
+            )
+            SELECT COUNT(*) AS n
+            FROM latest
+            WHERE LOWER(COALESCE(error_level,'')) IN ('critical','error','fatal','warning')
+               OR hourly_ratio >= 0.6;
+        """
         cur.execute(crit_q, (start, end))
         critical = cur.fetchone()["n"] or 0
         cur.execute(crit_q, (start, midpoint))
@@ -386,6 +425,8 @@ def api_robots(
 ) -> dict[str, Any]:
     with get_cursor() as cur:
         start, end = _resolve_window(cur, start_date, end_date)
+
+        # Latest log per robot in window (for the "current state" columns)
         sql = """
             WITH latest AS (
                 SELECT DISTINCT ON (robot_id)
@@ -408,22 +449,69 @@ def api_robots(
         cur.execute(sql, params)
         rows = cur.fetchall()
 
+        # Per-robot supplementary aggregates over the same window:
+        #   - 7-day forecast = AVG(hourly_ratio) over the most-recent 7 days
+        #   - active_errors  = distinct error_type values in the most-recent 30 days
+        seven_day_cut = end - timedelta(days=7)
+        cur.execute(
+            """
+            SELECT robot_id, AVG(hourly_ratio) AS r7
+            FROM public.robot_logs_error
+            WHERE robot_id IS NOT NULL
+              AND task_time BETWEEN %s AND %s
+            GROUP BY robot_id;
+            """,
+            (seven_day_cut, end),
+        )
+        seven_day = {r["robot_id"]: float(r["r7"] or 0) for r in cur.fetchall()}
+
+        active_errs_cut = end - timedelta(days=30)
+        cur.execute(
+            """
+            SELECT robot_id, error_type, COUNT(*) AS cnt
+            FROM public.robot_logs_error
+            WHERE robot_id IS NOT NULL AND error_type IS NOT NULL
+              AND task_time BETWEEN %s AND %s
+            GROUP BY robot_id, error_type
+            ORDER BY robot_id, cnt DESC;
+            """,
+            (active_errs_cut, end),
+        )
+        active_map: dict[str, list[str]] = {}
+        for r in cur.fetchall():
+            active_map.setdefault(r["robot_id"], [])
+            if len(active_map[r["robot_id"]]) < 3:
+                active_map[r["robot_id"]].append(r["error_type"])
+
         out = []
         for r in rows:
-            st = _classify_status(r["error_level"], r["hourly_ratio"])
-            if status and status.lower() not in ("all", "all statuses") and st.lower() != status.lower():
+            prob = float(r["hourly_ratio"] or 0)
+            forecast = seven_day.get(r["robot_id"], prob)
+            code = _status_code(r["error_level"], prob, forecast)
+            severity = _normalize_severity(r["error_level"])
+            legacy_status = _classify_status(r["error_level"], r["hourly_ratio"])
+            if status and status.lower() not in ("all", "all statuses") and legacy_status.lower() != status.lower():
                 continue
+            # Estimated remaining time before predicted failure (synthetic 0-168h)
+            est_hours = max(0, round(168 * max(0.0, 1 - max(prob, forecast)), 0))
             out.append({
                 "robot_id": r["robot_id"],
                 "area": r["product_code"] or "Unknown",
-                "status": st,
+                "status": legacy_status,             # kept for back-compat
+                "status_code": code,                 # new: FAULTED/MAINTENANCE/MONITOR/OPERATIONAL
+                "severity": severity,                # new: Event/Warning/Error/Fatal
                 "predicted_fault": r["error_type"] or "No Fault Detected",
                 "predicted_detail": r["error_detail"] or "All Systems Normal",
-                "confidence": round((r["hourly_ratio"] or 0) * 100, 0),
+                "confidence": round(prob * 100, 0),
+                "fault_probability": round(prob * 100, 1),
+                "seven_day_forecast": round(forecast * 100, 1),
+                "estimated_hours": int(est_hours),
+                "active_errors": active_map.get(r["robot_id"], []),
                 "last_updated": r["task_time"].isoformat() if r["task_time"] else None,
             })
-        order = {"Critical": 0, "Warning": 1, "Normal": 2}
-        out.sort(key=lambda x: (order.get(x["status"], 3), x["robot_id"]))
+
+        order = {"FAULTED": 0, "MAINTENANCE": 1, "MONITOR": 2, "OPERATIONAL": 3}
+        out.sort(key=lambda x: (order.get(x["status_code"], 9), x["robot_id"]))
         start_idx = (page - 1) * page_size
         return {"total": len(out), "page": page, "page_size": page_size, "items": out[start_idx:start_idx + page_size]}
 
@@ -899,6 +987,77 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
 .notif-list .when{font-size:10.5px;color:var(--text-mute);white-space:nowrap}
 .notif-empty{padding:30px;text-align:center;color:var(--text-mute);font-size:13px}
 
+/* Settings popover (above user card) */
+.user-card{cursor:pointer;border:none;width:100%;font-family:inherit;text-align:left;color:inherit}
+.user-card:hover{background:rgba(255,255,255,.07)}
+.settings-popover{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);
+  border-radius:10px;padding:12px;color:var(--sidebar-fg);margin-bottom:6px}
+.settings-popover[hidden]{display:none}
+.settings-popover h4{margin:0 0 10px;font-size:12.5px;font-weight:700;color:#fff;
+  text-transform:uppercase;letter-spacing:.06em}
+.setting-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+.setting-row:last-child{margin-bottom:0}
+.setting-row label{font-size:11.5px;color:var(--sidebar-fg-mute);font-weight:600}
+.seg{display:inline-flex;background:rgba(0,0,0,.2);border-radius:7px;padding:2px;gap:1px}
+.seg-btn{background:transparent;border:none;color:var(--sidebar-fg);
+  padding:5px 10px;border-radius:6px;font-size:11.5px;font-weight:600;cursor:pointer}
+.seg-btn.active{background:var(--primary);color:#fff}
+.seg-btn:hover:not(.active){background:rgba(255,255,255,.05)}
+
+/* DrGb24-style status pills (FAULTED/MAINTENANCE/MONITOR/OPERATIONAL) */
+.status.faulted{background:var(--red-soft);color:#b91c1c}
+.status.faulted::before{background:var(--red)}
+.status.maintenance{background:#fed7aa;color:#9a3412}
+.status.maintenance::before{background:#ea580c}
+.status.monitor{background:var(--amber-soft);color:#b45309}
+.status.monitor::before{background:var(--amber)}
+.status.operational{background:var(--green-soft);color:#047857}
+.status.operational::before{background:var(--green)}
+
+/* Severity pill */
+.sev-pill{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:.02em}
+.sev-pill.Event{background:#e0e7ff;color:#3730a3}
+.sev-pill.Warning{background:var(--amber-soft);color:#b45309}
+.sev-pill.Error{background:var(--red-soft);color:#b91c1c}
+.sev-pill.Fatal{background:#1f2937;color:#fff}
+
+/* Active error chips */
+.err-chips{display:flex;flex-wrap:wrap;gap:4px;max-width:220px}
+.err-chip{background:#f1f5f9;color:#475569;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:500;
+  max-width:160px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.err-chip.empty{background:transparent;color:var(--text-mute);font-style:italic;padding:2px 0}
+
+/* Inline-date heatmap row layout */
+.heatmap.inline .row{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.heatmap.inline .rlabel{width:110px;font-weight:600;color:var(--text);font-size:12px}
+.heatmap.inline .dlabel{font-size:10.5px;color:var(--text-mute);padding:0 4px;
+  font-variant-numeric:tabular-nums;white-space:nowrap}
+.heatmap.inline .cell{width:24px;height:24px;border-radius:5px;flex-shrink:0}
+
+/* Dark mode */
+body.dark{
+  --bg:#0b1220;
+  --card:#111a2c;
+  --border:#1f2a44;
+  --text:#e2e8f0;
+  --text-mute:#94a3b8;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 1px 3px rgba(0,0,0,.5);
+}
+body.dark .bell,body.dark .date-picker,body.dark .icon-btn,body.dark .pagination button,
+body.dark table.data thead th,body.dark .filter-row,body.dark .search input,
+body.dark .select,body.dark .input-date,body.dark .btn-ghost,body.dark .pred-card .btn-view{
+  background:#172238;color:var(--text);border-color:var(--border)
+}
+body.dark .stat-bar{background:#1e293b}
+body.dark .confidence-bar{background:#1e293b}
+body.dark .robot-thumb,body.dark .pred-card .thumb{background:#1e293b;color:#cbd5e1}
+body.dark table.data tbody tr:hover{background:#152034}
+body.dark table.data thead th{background:#152034}
+body.dark .modal,body.dark .popover,body.dark .notif-panel{background:#111a2c;color:var(--text);border-color:var(--border)}
+body.dark .popover .row input,body.dark .popover .quick button{background:#172238;color:var(--text);border-color:var(--border)}
+body.dark .err-chip{background:#1e293b;color:#cbd5e1}
+body.dark .stat-title{color:var(--text-mute)}
+
 .card{background:var(--card);border-radius:var(--radius);border:1px solid var(--border);
   box-shadow:var(--shadow);padding:20px}
 .cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin-bottom:18px}
@@ -1057,7 +1216,7 @@ table.data tbody tr:last-child td{border-bottom:none}
 .cat-legend .dot{width:9px;height:9px;border-radius:50%}
 
 .heat-card,.degr-card{padding:20px}
-.preds-row{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;margin-bottom:18px}
+.preds-row{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}
 .heatmap{display:grid;gap:6px;align-items:center;margin-top:10px}
 .heatmap .row{display:flex;align-items:center;gap:6px}
 .heatmap .rlabel{font-size:11px;color:var(--text-mute);width:120px;white-space:nowrap;
@@ -1074,6 +1233,12 @@ table.data tbody tr:last-child td{border-bottom:none}
 .degr-grid .mini{position:relative;height:220px}
 .degr-grid h4{margin:0 0 6px;font-size:13px;font-weight:600}
 .degr-grid .pred-badge{position:absolute;top:0;right:0;background:var(--red-soft);
+  color:#b91c1c;font-size:11px;padding:4px 8px;border-radius:6px;font-weight:600;
+  text-align:center;line-height:1.2;z-index:2}
+.degr-single{margin-top:10px}
+.degr-single h4{margin:0 0 6px;font-size:13px;font-weight:600}
+.degr-single .lstm-big{position:relative;height:300px}
+.degr-single .pred-badge{position:absolute;top:0;right:0;background:var(--red-soft);
   color:#b91c1c;font-size:11px;padding:4px 8px;border-radius:6px;font-weight:600;
   text-align:center;line-height:1.2;z-index:2}
 
@@ -1148,25 +1313,41 @@ table.data tbody tr:last-child td{border-bottom:none}
         </div>
       </div>
       <nav class="nav" id="mainNav">
-        <button class="nav-item active" data-page="dashboard"><span class="nav-icon">⌂</span><span class="nav-label">Dashboard</span></button>
-        <button class="nav-item" data-page="monitoring"><span class="nav-icon">⚙</span><span class="nav-label">Robot Monitoring</span><span class="nav-arrow">›</span></button>
-        <button class="nav-item" data-page="predictions"><span class="nav-icon">▣</span><span class="nav-label">Predictions &amp; Analysis</span><span class="nav-arrow">›</span></button>
-        <button class="nav-item" data-page="fault-history"><span class="nav-icon">⏲</span><span class="nav-label">Fault History</span><span class="nav-arrow">›</span></button>
-        <button class="nav-item" data-page="maintenance"><span class="nav-icon">▤</span><span class="nav-label">Maintenance Logs</span></button>
-        <button class="nav-item" data-page="model"><span class="nav-icon">◈</span><span class="nav-label">Model Performance</span></button>
-        <button class="nav-item" data-page="settings"><span class="nav-icon">⚙</span><span class="nav-label">Settings</span></button>
+        <button class="nav-item active" data-page="dashboard"><span class="nav-icon">⌂</span><span class="nav-label" data-i18n="navDashboard">Dashboard</span></button>
+        <button class="nav-item" data-page="predictions"><span class="nav-icon">▣</span><span class="nav-label" data-i18n="navPredictions">Predictions &amp; Analysis</span><span class="nav-arrow">›</span></button>
+        <button class="nav-item" data-page="fault-history"><span class="nav-icon">⏲</span><span class="nav-label" data-i18n="navFaultHistory">Fault History</span><span class="nav-arrow">›</span></button>
       </nav>
     </div>
     <div class="sidebar-bottom">
       <div class="status-card">
         <span class="status-dot"></span>
-        <div><div class="status-title">System Status</div><div class="status-sub">All Systems Operational</div></div>
+        <div><div class="status-title" data-i18n="systemStatus">System Status</div><div class="status-sub" data-i18n="allSystemsOperational">All Systems Operational</div></div>
       </div>
-      <div class="user-card">
+
+      <!-- Settings popover above the user card -->
+      <div class="settings-popover" id="settingsPopover" hidden onclick="event.stopPropagation()">
+        <h4 data-i18n="settings">Settings</h4>
+        <div class="setting-row">
+          <label data-i18n="language">Language</label>
+          <div class="seg">
+            <button class="seg-btn" data-lang="en" onclick="setLanguage('en')">EN</button>
+            <button class="seg-btn" data-lang="tr" onclick="setLanguage('tr')">TR</button>
+          </div>
+        </div>
+        <div class="setting-row">
+          <label data-i18n="theme">Theme</label>
+          <div class="seg">
+            <button class="seg-btn" data-theme="light" onclick="setTheme('light')"><span data-i18n="lightMode">Light</span></button>
+            <button class="seg-btn" data-theme="dark"  onclick="setTheme('dark')"><span data-i18n="darkMode">Dark</span></button>
+          </div>
+        </div>
+      </div>
+
+      <button class="user-card" onclick="toggleSettings(event)" aria-label="Settings">
         <div class="user-avatar">AE</div>
         <div class="user-meta"><div class="user-name">Admin User</div><div class="user-mail">admin@roboclean.com</div></div>
-        <span class="user-caret">▾</span>
-      </div>
+        <span class="user-caret">▴</span>
+      </button>
     </div>
   </aside>
 
@@ -1176,8 +1357,8 @@ table.data tbody tr:last-child td{border-bottom:none}
       <header class="topbar">
         <button class="hamburger" onclick="toggleSidebar()" aria-label="Open menu">☰</button>
         <div class="topbar-left">
-          <h1>Dashboard</h1>
-          <p>Real-time overview of your autonomous cleaning robots</p>
+          <h1 data-i18n="dashboardTitle">Dashboard</h1>
+          <p data-i18n="dashboardSubtitle">Real-time overview of your autonomous cleaning robots</p>
         </div>
         <div class="topbar-right">
           <button class="bell" id="bellBtn" aria-label="Notifications" onclick="toggleNotifPanel(event)"><span>🔔</span><span class="bell-badge" id="bellBadge">0</span></button>
@@ -1188,7 +1369,7 @@ table.data tbody tr:last-child td{border-bottom:none}
         <div class="card stat">
           <div class="stat-icon icon-blue"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="11" rx="2"></rect><path d="M8 8V6a4 4 0 0 1 8 0v2"></path><circle cx="9" cy="13" r="1"></circle><circle cx="15" cy="13" r="1"></circle></svg></div>
           <div class="stat-body">
-            <div class="stat-title">Active Robots</div>
+            <div class="stat-title" data-i18n="activeRobots">Active Robots</div>
             <div class="stat-value" id="activeRobotsValue">—</div>
             <div class="stat-sub" id="activeRobotsSub">of — total robots</div>
           </div>
@@ -1198,9 +1379,9 @@ table.data tbody tr:last-child td{border-bottom:none}
         <div class="card stat">
           <div class="stat-icon icon-red"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 L22 20 L2 20 Z"></path><path d="M12 9v5"></path><circle cx="12" cy="17" r="1" fill="currentColor"></circle></svg></div>
           <div class="stat-body">
-            <div class="stat-title">Critical Fault Alerts</div>
+            <div class="stat-title" data-i18n="criticalAlerts">Critical Fault Alerts</div>
             <div class="stat-value" id="criticalValue">—</div>
-            <div class="stat-sub">robots require attention</div>
+            <div class="stat-sub" data-i18n="requireAttention">robots require attention</div>
           </div>
           <div class="stat-trend" id="criticalTrend"></div>
           <div class="stat-bar"><div class="stat-bar-fill red" id="criticalBar" style="width:0%"></div></div>
@@ -1208,9 +1389,9 @@ table.data tbody tr:last-child td{border-bottom:none}
         <div class="card stat">
           <div class="stat-icon icon-green"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg></div>
           <div class="stat-body">
-            <div class="stat-title">Overall Fleet Health</div>
+            <div class="stat-title" data-i18n="fleetHealth">Overall Fleet Health</div>
             <div class="stat-value" id="fleetValue">—%</div>
-            <div class="stat-sub">healthy robots</div>
+            <div class="stat-sub" data-i18n="healthyRobots">healthy robots</div>
           </div>
           <div class="stat-trend" id="fleetTrend"></div>
           <div class="stat-bar"><div class="stat-bar-fill green" id="fleetBar" style="width:0%"></div></div>
@@ -1236,17 +1417,26 @@ table.data tbody tr:last-child td{border-bottom:none}
 
       <section class="card table-card">
         <div class="table-head">
-          <h3>Robot Health Overview</h3>
+          <h3 data-i18n="robotHealth">Robot Health Overview</h3>
           <div class="table-controls">
-            <div class="search"><span class="search-icon">🔎</span><input type="search" id="robotSearch" placeholder="Search robot ID..." /></div>
+            <div class="search"><span class="search-icon">🔎</span><input type="search" id="robotSearch" placeholder="Search robot ID..." data-i18n-ph="searchRobot" /></div>
             <select class="select" id="statusFilter"></select>
             <select class="select" id="faultFilter"></select>
           </div>
         </div>
         <div class="table-wrap">
           <table class="data">
-            <thead><tr><th>Robot ID</th><th>Status</th><th>Predicted Fault</th><th>Semantic Score</th><th>Last Updated ↕</th><th class="action-col">Action</th></tr></thead>
-            <tbody id="robotTableBody"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+            <thead><tr>
+              <th data-i18n="colRobot">Robot</th>
+              <th data-i18n="colStatus">Status</th>
+              <th data-i18n="colSemantic">Semantic Score</th>
+              <th data-i18n="colSeverity">Severity</th>
+              <th data-i18n="colForecast">7-Day Forecast</th>
+              <th data-i18n="colErrors">Active Errors</th>
+              <th data-i18n="colLastUpdated">Last Updated</th>
+              <th class="action-col" data-i18n="colAction">Action</th>
+            </tr></thead>
+            <tbody id="robotTableBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
           </table>
         </div>
         <div class="table-foot">
@@ -1260,8 +1450,8 @@ table.data tbody tr:last-child td{border-bottom:none}
       <header class="topbar">
         <button class="hamburger" onclick="toggleSidebar()" aria-label="Open menu">☰</button>
         <div class="topbar-left">
-          <h1>Fault History</h1>
-          <p>Browse and analyze historical faults and system issues</p>
+          <h1 data-i18n="faultHistoryTitle">Fault History</h1>
+          <p data-i18n="faultHistorySub">Browse and analyze historical faults and system issues</p>
         </div>
         <div class="topbar-right">
           <button class="bell" aria-label="Notifications" onclick="toggleNotifPanel(event)"><span>🔔</span><span class="bell-badge" id="bellBadge2">0</span></button>
@@ -1321,8 +1511,8 @@ table.data tbody tr:last-child td{border-bottom:none}
       <header class="topbar">
         <button class="hamburger" onclick="toggleSidebar()" aria-label="Open menu">☰</button>
         <div class="topbar-left">
-          <h1>Predictions &amp; Analysis</h1>
-          <p>AI-powered insights and predictive analytics for your robot fleet</p>
+          <h1 data-i18n="predictionsTitle">Predictions &amp; Analysis</h1>
+          <p data-i18n="predictionsSubtitle">AI-powered insights and predictive analytics for your robot fleet</p>
         </div>
         <div class="topbar-right">
           <button class="bell" aria-label="Notifications" onclick="toggleNotifPanel(event)"><span>🔔</span><span class="bell-badge" id="bellBadge3">0</span></button>
@@ -1343,17 +1533,17 @@ table.data tbody tr:last-child td{border-bottom:none}
       <div class="preds-row">
         <div class="card heat-card">
           <div class="chart-head">
-            <h3>Fleet Risk Assessment Heatmap <span class="info" title="Per-robot average risk per week (red = high risk)">ⓘ</span></h3>
+            <h3 data-i18n="fleetRiskHeatmap">Fleet Risk Assessment Heatmap</h3>
           </div>
           <div style="display:flex;gap:12px;align-items:flex-end">
-            <div class="heatmap" id="heatmapGrid" style="flex:1"></div>
-            <div class="heat-legend"><div>High</div><div class="bar"></div><div>Low</div></div>
+            <div class="heatmap inline" id="heatmapGrid" style="flex:1"></div>
+            <div class="heat-legend"><div data-i18n="heatHigh">High</div><div class="bar"></div><div data-i18n="heatLow">Low</div></div>
           </div>
         </div>
 
         <div class="card degr-card">
           <div class="chart-head">
-            <h3>Component Degradation Over Time <span class="info" title="Health score over time + projected failure">ⓘ</span></h3>
+            <h3 data-i18n="componentDegradation">Component Degradation Over Time</h3>
             <select class="select" id="degrCategoryFilter">
               <option>Brush Motor Issues</option>
               <option>Battery &amp; Power</option>
@@ -1361,11 +1551,12 @@ table.data tbody tr:last-child td{border-bottom:none}
               <option>Vacuum System</option>
             </select>
           </div>
-          <div class="degr-grid">
-            <div><h4>LSTM Model Prediction</h4>
-              <div class="mini"><span class="pred-badge" id="lstmBadge">—</span><canvas id="lstmChart"></canvas></div></div>
-            <div><h4>Random Forest Model Prediction</h4>
-              <div class="mini"><span class="pred-badge" id="rfBadge">—</span><canvas id="rfChart"></canvas></div></div>
+          <div class="degr-single">
+            <h4 data-i18n="lstmModelPred">LSTM Model Prediction</h4>
+            <div class="mini lstm-big">
+              <span class="pred-badge" id="lstmBadge">—</span>
+              <canvas id="lstmChart"></canvas>
+            </div>
           </div>
         </div>
       </div>
@@ -1403,27 +1594,6 @@ table.data tbody tr:last-child td{border-bottom:none}
         </div>
         <div class="pred-cards" id="predCardsContainer"><div class="empty">Loading…</div></div>
       </section>
-    </section>
-
-    <section class="page" id="page-monitoring">
-      <header class="topbar"><button class="hamburger" onclick="toggleSidebar()">☰</button>
-        <div class="topbar-left"><h1>Robot Monitoring</h1><p>Coming soon</p></div></header>
-      <div class="card empty">Robot monitoring view will live here.</div>
-    </section>
-    <section class="page" id="page-maintenance">
-      <header class="topbar"><button class="hamburger" onclick="toggleSidebar()">☰</button>
-        <div class="topbar-left"><h1>Maintenance Logs</h1><p>Coming soon</p></div></header>
-      <div class="card empty">Maintenance logs view will live here.</div>
-    </section>
-    <section class="page" id="page-model">
-      <header class="topbar"><button class="hamburger" onclick="toggleSidebar()">☰</button>
-        <div class="topbar-left"><h1>Model Performance</h1><p>LSTM partitioned model metrics</p></div></header>
-      <div class="card" id="modelInfoCard">Loading…</div>
-    </section>
-    <section class="page" id="page-settings">
-      <header class="topbar"><button class="hamburger" onclick="toggleSidebar()">☰</button>
-        <div class="topbar-left"><h1>Settings</h1><p>Coming soon</p></div></header>
-      <div class="card empty">Settings view will live here.</div>
     </section>
 
   </main>
@@ -1466,6 +1636,86 @@ table.data tbody tr:last-child td{border-bottom:none}
 </div>
 
 <script>
+// ===== i18n =====
+const I18N = {
+  en: {
+    navDashboard: "Dashboard", navPredictions: "Predictions & Analysis", navFaultHistory: "Fault History",
+    dashboardTitle: "Dashboard", dashboardSubtitle: "Real-time overview of your autonomous cleaning robots",
+    activeRobots: "Active Robots", criticalAlerts: "Critical Fault Alerts", fleetHealth: "Overall Fleet Health",
+    healthyRobots: "healthy robots", requireAttention: "robots require attention",
+    robotHealth: "Robot Health Overview", searchRobot: "Search robot ID...",
+    colRobot:"Robot", colStatus:"Status", colFault:"Predicted Fault", colSemantic:"Semantic Score",
+    colSeverity:"Severity", colForecast:"7-Day Forecast", colErrors:"Active Errors",
+    colLastUpdated:"Last Updated", colAction:"Action",
+    statusFAULTED:"Faulted", statusMAINTENANCE:"Needs Maintenance", statusMONITOR:"Monitor", statusOPERATIONAL:"Operational",
+    predictionsTitle: "Predictions & Analysis", predictionsSubtitle: "AI-powered insights and predictive analytics for your robot fleet",
+    fleetRiskHeatmap: "Fleet Risk Assessment Heatmap", componentDegradation: "Component Degradation Over Time",
+    lstmModelPred: "LSTM Model Prediction", heatHigh:"High", heatLow:"Low",
+    faultHistoryTitle: "Fault History", faultHistorySub: "Browse and analyze historical faults and system issues",
+    settings: "Settings", language: "Language", theme: "Theme", lightMode:"Light", darkMode:"Dark",
+    systemStatus: "System Status", allSystemsOperational: "All Systems Operational",
+    vsPrev:"vs prev period", searchFaults:"Search faults...",
+    noRobots:"No robots found", noFaults:"No faults match the filters", noAlerts:"No active alerts",
+    showing: "Showing", to: "to", of: "of", robots: "robots", faults: "faults",
+    notifications: "Notifications", markAllRead: "Mark all read",
+    selectRange: "Select Date Range", last7:"Last 7 days", last30:"Last 30 days", last90:"Last 90 days", allTime:"All time",
+    startDate:"Start date", endDate:"End date", reset:"Reset", apply:"Apply",
+    failureProb: "Failure Probability", predictedIssue: "Predicted Issue", estimatedTime: "Estimated Time", viewDetails: "View Details",
+    avgFleetHealth: "Average Fleet Health", highRiskRobots: "High Risk Robots", predFailures: "Predicted Failures (48h)", modelAccuracy: "Model Accuracy",
+    topFailurePred: "Top Failure Predictions (Next 48 Hours)",
+  },
+  tr: {
+    navDashboard: "Gösterge Paneli", navPredictions: "Tahminler & Analiz", navFaultHistory: "Arıza Geçmişi",
+    dashboardTitle: "Gösterge Paneli", dashboardSubtitle: "Otonom temizlik robotlarınızın gerçek zamanlı görünümü",
+    activeRobots: "Aktif Robotlar", criticalAlerts: "Kritik Arıza Uyarıları", fleetHealth: "Genel Filo Sağlığı",
+    healthyRobots: "sağlıklı robot", requireAttention: "robot ilgi bekliyor",
+    robotHealth: "Robot Sağlık Özeti", searchRobot: "Robot ID ara...",
+    colRobot:"Robot", colStatus:"Durum", colFault:"Tahmin Edilen Arıza", colSemantic:"Semantik Skor",
+    colSeverity:"Şiddet", colForecast:"7 Günlük Öngörü", colErrors:"Aktif Hatalar",
+    colLastUpdated:"Son Güncelleme", colAction:"İşlem",
+    statusFAULTED:"Arızalı", statusMAINTENANCE:"Bakım Gerekli", statusMONITOR:"Takipte", statusOPERATIONAL:"Çalışır Durumda",
+    predictionsTitle: "Tahminler & Analiz", predictionsSubtitle: "Robot filonuz için yapay zeka destekli öngörüler",
+    fleetRiskHeatmap: "Filo Risk Haritası", componentDegradation: "Bileşen Yıpranma Trendi",
+    lstmModelPred: "LSTM Model Tahmini", heatHigh:"Yüksek", heatLow:"Düşük",
+    faultHistoryTitle: "Arıza Geçmişi", faultHistorySub: "Tarihsel arızaları ve sistem sorunlarını incele",
+    settings: "Ayarlar", language: "Dil", theme: "Tema", lightMode:"Aydınlık", darkMode:"Karanlık",
+    systemStatus: "Sistem Durumu", allSystemsOperational: "Tüm Sistemler Çalışıyor",
+    vsPrev:"önceki döneme göre", searchFaults:"Arıza ara...",
+    noRobots:"Robot bulunamadı", noFaults:"Filtrelere uyan arıza yok", noAlerts:"Aktif uyarı yok",
+    showing:"Gösteriliyor", to:"-", of:"/", robots:"robot", faults:"arıza",
+    notifications: "Bildirimler", markAllRead: "Tümünü okundu say",
+    selectRange: "Tarih Aralığı Seç", last7:"Son 7 gün", last30:"Son 30 gün", last90:"Son 90 gün", allTime:"Tüm zaman",
+    startDate:"Başlangıç tarihi", endDate:"Bitiş tarihi", reset:"Sıfırla", apply:"Uygula",
+    failureProb: "Arıza Olasılığı", predictedIssue: "Tahmin Edilen Sorun", estimatedTime: "Tahmini Zaman", viewDetails: "Detayları Gör",
+    avgFleetHealth: "Ortalama Filo Sağlığı", highRiskRobots: "Yüksek Riskli Robotlar", predFailures: "Tahmini Arızalar (48s)", modelAccuracy: "Model Doğruluğu",
+    topFailurePred: "En Yüksek Arıza Tahminleri (Sonraki 48 Saat)",
+  }
+};
+let currentLang = localStorage.getItem("lang") || "en";
+let currentTheme = localStorage.getItem("theme") || "light";
+function t(key){ return (I18N[currentLang] && I18N[currentLang][key]) || I18N.en[key] || key; }
+function applyLanguage(lang){
+  currentLang = (I18N[lang] ? lang : "en");
+  localStorage.setItem("lang", currentLang);
+  document.documentElement.lang = currentLang;
+  document.querySelectorAll("[data-i18n]").forEach(el => { el.textContent = t(el.dataset.i18n); });
+  document.querySelectorAll("[data-i18n-ph]").forEach(el => { el.placeholder = t(el.dataset.i18nPh); });
+  document.querySelectorAll(".seg-btn[data-lang]").forEach(b => b.classList.toggle("active", b.dataset.lang === currentLang));
+}
+function setLanguage(lang){ applyLanguage(lang); reloadCurrentPage(); refreshNotificationBadge(); }
+function applyTheme(theme){
+  currentTheme = (theme === "dark" ? "dark" : "light");
+  localStorage.setItem("theme", currentTheme);
+  document.body.classList.toggle("dark", currentTheme === "dark");
+  document.querySelectorAll(".seg-btn[data-theme]").forEach(b => b.classList.toggle("active", b.dataset.theme === currentTheme));
+}
+function setTheme(theme){ applyTheme(theme); }
+function toggleSettings(ev){
+  ev.stopPropagation();
+  const p = document.getElementById("settingsPopover");
+  p.hidden = !p.hidden;
+}
+
 const FAULT_COLORS = ["#3b82f6","#10b981","#f59e0b","#a855f7","#94a3b8"];
 const CAT_COLORS = {
   "Brush Motor Issues":"#3b82f6","Battery & Power":"#10b981","Navigation System":"#f59e0b",
@@ -1482,6 +1732,8 @@ const state = {
 let charts = {};
 
 document.addEventListener("DOMContentLoaded", () => {
+  applyTheme(currentTheme);
+  applyLanguage(currentLang);
   bindNav(); bindDashboardUI(); bindFaultHistoryUI(); bindPredictionsUI();
   const initial = (location.hash || "#dashboard").replace("#","");
   navigate(initial);
@@ -1508,7 +1760,6 @@ function navigate(page, updateHash=true){
   if (page==="dashboard")     loadDashboard();
   if (page==="fault-history") loadFaultHistory();
   if (page==="predictions")   loadPredictions();
-  if (page==="model")         loadModelInfo();
 }
 function toggleSidebar(){ document.getElementById("sidebar").classList.toggle("open"); }
 
@@ -1675,10 +1926,15 @@ async function loadRobots(){
 
 function renderRobotTable({items}){
   const body = document.getElementById("robotTableBody");
-  if (!items.length){ body.innerHTML = `<tr><td colspan="6" class="empty">No robots found</td></tr>`; return; }
+  if (!items.length){ body.innerHTML = `<tr><td colspan="8" class="empty">${t("noRobots")}</td></tr>`; return; }
   body.innerHTML = items.map(r=>{
-    const conf = Math.round(r.confidence ?? 0);
-    let cc = "green"; if (conf>=60) cc="red"; else if (conf>=30) cc="amber";
+    const prob = Math.round(r.fault_probability ?? r.confidence ?? 0);
+    const fc = Math.round(r.seven_day_forecast ?? 0);
+    const code = r.status_code || "OPERATIONAL";
+    const cls = code.toLowerCase();
+    let pc = "green"; if (prob>=60) pc="red"; else if (prob>=30) pc="amber";
+    let fcCls = "green"; if (fc>=60) fcCls="red"; else if (fc>=30) fcCls="amber";
+    const errs = (r.active_errors || []);
     return `
       <tr>
         <td>
@@ -1690,21 +1946,29 @@ function renderRobotTable({items}){
             </div>
           </div>
         </td>
-        <td><span class="status ${r.status.toLowerCase()}">${r.status}</span></td>
-        <td>
-          <div class="fault-name">${escapeHtml(r.predicted_fault)}</div>
-          <div class="fault-detail">${escapeHtml(r.predicted_detail || "")}</div>
-        </td>
+        <td><span class="status ${cls}">${escapeHtml(t("status"+code) || code)}</span></td>
         <td>
           <div class="confidence">
-            <span class="confidence-num">${conf}%</span>
-            <div class="confidence-bar"><div class="confidence-fill ${cc}" style="width:${conf}%"></div></div>
+            <span class="confidence-num">${prob}%</span>
+            <div class="confidence-bar"><div class="confidence-fill ${pc}" style="width:${prob}%"></div></div>
+          </div>
+        </td>
+        <td><span class="sev-pill ${escapeAttr(r.severity || 'Event')}">${escapeHtml(r.severity || "Event")}</span></td>
+        <td>
+          <div class="confidence">
+            <span class="confidence-num">${fc}%</span>
+            <div class="confidence-bar"><div class="confidence-fill ${fcCls}" style="width:${fc}%"></div></div>
+          </div>
+        </td>
+        <td>
+          <div class="err-chips">
+            ${errs.length ? errs.map(e=>`<span class="err-chip" title="${escapeAttr(e)}">${escapeHtml(e)}</span>`).join("")
+              : `<span class="err-chip empty">—</span>`}
           </div>
         </td>
         <td>${formatLong(r.last_updated)}</td>
         <td class="action-col">
-          <button class="btn-secondary" onclick="openRobotModal('${escapeAttr(r.robot_id)}')">View Details</button>
-          <button class="kebab" title="More">⋮</button>
+          <button class="btn-secondary" onclick="openRobotModal('${escapeAttr(r.robot_id)}')">${t("viewDetails")}</button>
         </td>
       </tr>`;
   }).join("");
@@ -1828,13 +2092,20 @@ async function loadHeatmap(){
     const d = await fetchJson("/api/predictions/heatmap");
     const grid = document.getElementById("heatmapGrid");
     if (!d.robot_ids.length){ grid.innerHTML = `<div class="empty">No data</div>`; return; }
-    const rows = d.robot_ids.map((rid,i)=>`
-      <div class="row">
-        <div class="rlabel" title="${escapeAttr(rid)}">${escapeHtml(shortenId(rid))}</div>
-        ${d.grid[i].map(v=>`<div class="cell" style="background:${riskColor(v)}" title="${v}%"></div>`).join("")}
-      </div>`).join("");
-    const labels = `<div class="clabels">${d.weeks.map(w=>`<span>${escapeHtml(w)}</span>`).join("")}</div>`;
-    grid.innerHTML = rows + labels;
+    // Inline layout: each row is [robot label] [date1 cell1] [date2 cell2] ...
+    // so the date label sits beside the cell it represents, not stacked below.
+    const rows = d.robot_ids.map((rid,i)=>{
+      const cells = d.weeks.map((w, j)=>{
+        const v = d.grid[i][j];
+        return `<span class="dlabel">${escapeHtml(w)}</span>
+                <div class="cell" style="background:${riskColor(v)}" title="${escapeAttr(w)}: ${v}%"></div>`;
+      }).join("");
+      return `<div class="row">
+                <div class="rlabel" title="${escapeAttr(rid)}">${escapeHtml(shortenId(rid))}</div>
+                ${cells}
+              </div>`;
+    }).join("");
+    grid.innerHTML = rows;
   }catch(e){ console.error(e); }
 }
 
@@ -1850,7 +2121,6 @@ async function loadDegradation(){
   try{
     const d = await fetchJson(`/api/predictions/degradation?category=${encodeURIComponent(state.pred.category)}`);
     renderDegradation("lstmChart", "lstmBadge", d, "#3b82f6", false);
-    renderDegradation("rfChart", "rfBadge", d, "#10b981", true);
   }catch(e){ console.error(e); }
 }
 
@@ -2011,8 +2281,10 @@ document.addEventListener("click", e=>{
   // outside-click closing for popovers
   const dp = document.getElementById("datePopover");
   const np = document.getElementById("notifPanel");
+  const sp = document.getElementById("settingsPopover");
   if (!dp.hidden && !e.target.closest(".date-picker") && !e.target.closest("#datePopover")) dp.hidden = true;
   if (!np.hidden && !e.target.closest(".bell") && !e.target.closest("#notifPanel")) np.hidden = true;
+  if (sp && !sp.hidden && !e.target.closest(".user-card") && !e.target.closest("#settingsPopover")) sp.hidden = true;
 });
 
 // =========================================================================
