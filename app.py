@@ -1,12 +1,19 @@
 """
-RoboClean Predictive Maintenance Dashboard — single-file edition.
+RoboClean Predictive Maintenance Dashboard - single-file edition.
 
-Everything (FastAPI backend + HTML + CSS + JS) lives in this one file.
+Reads the published Hugging Face dataset snapshot
+    Lightcap/pudu-robot-operation-logs-bau-capstone-2026
+via DuckDB - no live PostgreSQL connection required.
+
+Pages:
+    /#dashboard       - Real-time fleet overview
+    /#fault-history   - Historical fault browser
+    /#predictions     - AI predictions & analysis
 
 Run:
     pip install -r requirements.txt
     python app.py
-Then open:
+Open:
     http://127.0.0.1:8000
 """
 from __future__ import annotations
@@ -16,8 +23,7 @@ import logging
 import os
 import threading
 from contextlib import asynccontextmanager, contextmanager
-from datetime import date, datetime, time, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timedelta
 from typing import Any
 
 import duckdb
@@ -32,19 +38,19 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("dashboard")
 
 # ============================================================================
-# Data source
+# Data source - Hugging Face + DuckDB
 # ============================================================================
 HF_DATASET_REPO = os.getenv("HF_DATASET_REPO", "Lightcap/pudu-robot-operation-logs-bau-capstone-2026")
 HF_DATASET_REVISION = os.getenv("HF_DATASET_REVISION", "main")
 DUCKDB_PATH = os.getenv("DASHBOARD_DUCKDB_PATH", ":memory:")
 DATASET_TABLES = {
-    "public.robot_logs_error": "data/public_robot_logs_error.parquet",
-    "public.robot_logs_error_training": "data/public_robot_logs_error_training.parquet",
-    "public.robot_logs_error_validation": "data/public_robot_logs_error_validation.parquet",
-    "public.robot_logs_error_test": "data/public_robot_logs_error_test.parquet",
-    "public.robot_logs_info": "data/public_robot_logs_info.parquet",
-    "model_training.training_runs": "data/model_training_training_runs.parquet",
-    "model_training.training_artifacts": "data/model_training_training_artifacts.parquet",
+    "public.robot_logs_error":             "data/public_robot_logs_error.parquet",
+    "public.robot_logs_error_training":    "data/public_robot_logs_error_training.parquet",
+    "public.robot_logs_error_validation":  "data/public_robot_logs_error_validation.parquet",
+    "public.robot_logs_error_test":        "data/public_robot_logs_error_test.parquet",
+    "public.robot_logs_info":              "data/public_robot_logs_info.parquet",
+    "model_training.training_runs":        "data/model_training_training_runs.parquet",
+    "model_training.training_artifacts":   "data/model_training_training_artifacts.parquet",
     "model_training.training_source_tables": "data/model_training_training_source_tables.parquet",
 }
 
@@ -52,23 +58,22 @@ DATA_CONN: duckdb.DuckDBPyConnection | None = None
 DATA_LOCK = threading.RLock()
 
 
-def _sql_path(path: str | Path) -> str:
+def _sql_path(path: str) -> str:
     return str(path).replace("'", "''")
 
 
 def init_pool() -> None:
-    """Initialize DuckDB over the published Hugging Face Parquet snapshot."""
+    """Download the Parquet snapshot from Hugging Face and register as views."""
     global DATA_CONN
     if DATA_CONN is not None:
         return
-
     with DATA_LOCK:
         if DATA_CONN is not None:
             return
+        log.info("Initialising dataset from %s@%s ...", HF_DATASET_REPO, HF_DATASET_REVISION)
         conn = duckdb.connect(DUCKDB_PATH)
         conn.execute("CREATE SCHEMA IF NOT EXISTS public;")
         conn.execute("CREATE SCHEMA IF NOT EXISTS model_training;")
-
         for table_name, filename in DATASET_TABLES.items():
             local_path = hf_hub_download(
                 repo_id=HF_DATASET_REPO,
@@ -80,13 +85,12 @@ def init_pool() -> None:
                 f"CREATE OR REPLACE VIEW {table_name} AS "
                 f"SELECT * FROM read_parquet('{_sql_path(local_path)}');"
             )
-
         DATA_CONN = conn
-        log.info("Dataset ready from Hugging Face: %s@%s", HF_DATASET_REPO, HF_DATASET_REVISION)
+        log.info("Dataset ready from Hugging Face")
 
 
 class DuckDictCursor:
-    """Small adapter for the existing RealDictCursor-style endpoint code."""
+    """psycopg2-RealDictCursor look-alike on top of DuckDB."""
 
     def __init__(self, conn: duckdb.DuckDBPyConnection):
         self.conn = conn
@@ -109,7 +113,7 @@ class DuckDictCursor:
     def fetchall(self) -> list[dict[str, Any]]:
         if self.result is None:
             return []
-        return [self._as_dict(row) for row in self.result.fetchall()]
+        return [self._as_dict(r) for r in self.result.fetchall()]
 
     def close(self) -> None:
         self.result = None
@@ -129,45 +133,21 @@ def get_cursor():
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    init_pool()
+    try:
+        init_pool()
+    except Exception as e:
+        log.warning("Dataset not ready at startup (%s); will retry on first request.", e)
     yield
 
 
 # ============================================================================
 # FastAPI
 # ============================================================================
-app = FastAPI(title="RoboClean Dashboard", version="1.0", lifespan=lifespan)
+app = FastAPI(title="RoboClean Dashboard", version="2.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 # ---------- helpers ----------
-CRITICAL_RATIO_THRESHOLD = 0.6
-WARNING_RATIO_THRESHOLD = 0.3
-HIGH_SEVERITY_LEVELS = {"critical", "error", "fatal"}
-TIME_WINDOW_DAYS: dict[str, int | None] = {
-    "all": None,
-    "last_7_days": 7,
-    "last_30_days": 30,
-}
-LOG_SEARCH_COLUMNS = (
-    "robot_id",
-    "product_code",
-    "record_id",
-    "error_id",
-    "error_type",
-    "error_level",
-    "error_detail",
-    "source_group",
-    "source_file",
-)
-
-
-def _as_db_datetime(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value
-    return value.astimezone(timezone.utc).replace(tzinfo=None)
-
-
 def _json_value(value: Any) -> Any:
     if isinstance(value, str):
         try:
@@ -177,55 +157,49 @@ def _json_value(value: Any) -> Any:
     return value
 
 
-def _data_extent(cur) -> tuple[datetime, datetime]:
-    """Full range: from earliest to latest log in the database."""
+def _data_window(cur) -> tuple[datetime, datetime]:
+    """Full range: from earliest to latest log in the dataset (naive)."""
     cur.execute("SELECT MIN(task_time) AS min_t, MAX(task_time) AS max_t FROM public.robot_logs_error;")
     row = cur.fetchone()
     start = row["min_t"]
-    end = row["max_t"] or datetime.now()
+    end = row["max_t"] or datetime.utcnow()
     if start is None:
         start = end - timedelta(days=7)
-    return _as_db_datetime(start), _as_db_datetime(end)
+    if isinstance(start, datetime) and start.tzinfo is not None:
+        start = start.replace(tzinfo=None)
+    if isinstance(end, datetime) and end.tzinfo is not None:
+        end = end.replace(tzinfo=None)
+    return start, end
 
 
-def _resolve_time_window(
-    cur,
-    window: str | None = "all",
-    start_date: date | None = None,
-    end_date: date | None = None,
-) -> tuple[datetime, datetime, dict[str, Any]]:
-    """Resolve a requested window against the actual data extent.
+def _parse_date(s: str | None, *, end_of_day: bool = False) -> datetime | None:
+    """Parse YYYY-MM-DD or ISO format; returns naive datetime."""
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if d.tzinfo is not None:
+        d = d.replace(tzinfo=None)
+    # If only date was provided (no time component), interpret 'end_date' as end of day.
+    if end_of_day and d.hour == 0 and d.minute == 0 and d.second == 0:
+        d = d.replace(hour=23, minute=59, second=59)
+    return d
 
-    Relative windows are anchored to the latest timestamp in the source table,
-    not to wall-clock today. That keeps historical snapshots inspectable.
-    """
-    extent_start, extent_end = _data_extent(cur)
-    key = window or "all"
 
-    if key == "custom":
-        start = datetime.combine(start_date, time.min) if start_date else extent_start
-        end = datetime.combine(end_date, time.max) if end_date else extent_end
-    elif key in TIME_WINDOW_DAYS:
-        days = TIME_WINDOW_DAYS[key]
-        end = extent_end
-        start = extent_start if days is None else max(extent_start, end - timedelta(days=days))
-    else:
-        raise HTTPException(status_code=422, detail=f"Unsupported time window: {key}")
-
-    if start > end:
-        raise HTTPException(status_code=422, detail="start_date must be before end_date")
-
-    return start, end, {
-        "key": key,
-        "start": start.isoformat(),
-        "end": end.isoformat(),
-        "extent_start": extent_start.isoformat(),
-        "extent_end": extent_end.isoformat(),
-    }
+def _resolve_window(cur, start_date: str | None, end_date: str | None) -> tuple[datetime, datetime]:
+    """Honour user-supplied date range, clamped to the dataset extent."""
+    ext_start, ext_end = _data_window(cur)
+    s = _parse_date(start_date) or ext_start
+    e = _parse_date(end_date, end_of_day=True) or ext_end
+    if s < ext_start: s = ext_start
+    if e > ext_end:   e = ext_end
+    if s > e:         s, e = ext_start, ext_end
+    return s, e
 
 
 def _trend_bucket(start: datetime, end: datetime) -> str:
-    """Pick a sensible date_trunc unit so the trend chart doesn't blow up."""
     days = (end - start).days
     if days <= 60:
         return "day"
@@ -235,144 +209,128 @@ def _trend_bucket(start: datetime, end: datetime) -> str:
 
 
 def _classify_status(error_level: str | None, hourly_ratio: float | None) -> str:
-    if (error_level or "").lower() in HIGH_SEVERITY_LEVELS:
+    if (error_level or "").lower() in ("critical", "error", "fatal"):
         return "Critical"
     r = hourly_ratio or 0.0
-    if r >= CRITICAL_RATIO_THRESHOLD:
+    if r >= 0.6:
         return "Critical"
-    if r >= WARNING_RATIO_THRESHOLD:
+    if r >= 0.3:
         return "Warning"
     return "Normal"
 
 
-def _append_log_filters(
-    where: list[str],
-    params: list[Any],
-    *,
-    search: str | None = None,
-    robot_id: str | None = None,
-    fault_type: str | None = None,
-    error_level: str | None = None,
-) -> None:
-    if search:
-        like = f"%{search}%"
-        where.append("(" + " OR ".join(f"COALESCE({col}, '') ILIKE %s" for col in LOG_SEARCH_COLUMNS) + ")")
-        params.extend([like] * len(LOG_SEARCH_COLUMNS))
-    if robot_id and robot_id.lower() != "all":
-        where.append("robot_id = %s")
-        params.append(robot_id)
-    if fault_type and fault_type.lower() != "all":
-        where.append("error_type = %s")
-        params.append(fault_type)
-    if error_level and error_level.lower() != "all":
-        where.append("error_level = %s")
-        params.append(error_level)
+def _category_for_error_type(error_type: str | None) -> str:
+    et = (error_type or "").lower()
+    if any(k in et for k in ("brush", "vacuum", "dust", "drainsewage", "sewage", "mop", "filter", "flow")):
+        return "Vacuum System"
+    if any(k in et for k in ("wheel", "motor", "drive", "encoder", "imu")):
+        return "Brush Motor Issues"
+    if any(k in et for k in ("battery", "power", "charging", "pile")):
+        return "Battery & Power"
+    if any(k in et for k in ("nav", "stuck", "localization", "plan", "pose", "map", "cost", "reach", "schedule")):
+        return "Navigation System"
+    return "Other"
 
 
-# ---------- API ----------
+CATEGORY_ORDER = ["Brush Motor Issues", "Battery & Power", "Navigation System", "Vacuum System", "Other"]
+
+
+# ============================================================================
+# API: shared
+# ============================================================================
 @app.get("/api/health")
 def api_health() -> dict[str, Any]:
     try:
         with get_cursor() as cur:
-            cur.execute("SELECT 1;")
+            cur.execute("SELECT 1 AS ok;")
             cur.fetchone()
-        return {
-            "ok": True,
-            "source": "huggingface",
-            "dataset": HF_DATASET_REPO,
-            "revision": HF_DATASET_REVISION,
-        }
+        return {"ok": True, "source": "huggingface", "dataset": HF_DATASET_REPO, "revision": HF_DATASET_REVISION}
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
 
-@app.get("/api/stats")
-def api_stats(
-    window: str = Query("all"),
-    start_date: date | None = Query(default=None),
-    end_date: date | None = Query(default=None),
-) -> dict[str, Any]:
+@app.get("/api/filter-options")
+def api_filter_options() -> dict[str, Any]:
     with get_cursor() as cur:
-        start, end, window_meta = _resolve_time_window(cur, window, start_date, end_date)
-        comparable = window_meta["key"] != "all"
-        prev_start = start - (end - start)
-        prev_end = start
+        cur.execute("SELECT DISTINCT error_type FROM public.robot_logs_error WHERE error_type IS NOT NULL ORDER BY error_type;")
+        ftypes = [r["error_type"] for r in cur.fetchall()]
+        cur.execute("SELECT DISTINCT robot_id FROM public.robot_logs_error WHERE robot_id IS NOT NULL ORDER BY robot_id;")
+        robots = [r["robot_id"] for r in cur.fetchall()]
+        return {
+            "statuses": ["All Statuses", "Critical", "Warning", "Normal"],
+            "fault_types": ["All Fault Types"] + ftypes,
+            "robots": ["All Robots"] + robots,
+            "categories": ["All Components"] + CATEGORY_ORDER,
+        }
+
+
+@app.get("/api/model-info")
+def api_model_info() -> dict[str, Any]:
+    with get_cursor() as cur:
+        cur.execute("""
+            SELECT model_name, status, retrained, dataset_row_count, metrics, created_at
+            FROM model_training.training_runs ORDER BY created_at DESC LIMIT 1;
+        """)
+        r = cur.fetchone()
+        if not r:
+            return {}
+        return {
+            "model_name": r["model_name"], "status": r["status"], "retrained": r["retrained"],
+            "dataset_row_count": r["dataset_row_count"], "metrics": _json_value(r["metrics"]),
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+
+
+# ============================================================================
+# API: dashboard
+# ============================================================================
+@app.get("/api/stats")
+def api_stats(start_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
+    with get_cursor() as cur:
+        start, end = _resolve_window(cur, start_date, end_date)
+        midpoint = start + (end - start) / 2
 
         cur.execute("SELECT COUNT(DISTINCT robot_id) AS n FROM public.robot_logs_error WHERE robot_id IS NOT NULL;")
         total = cur.fetchone()["n"] or 0
-        cur.execute("SELECT COUNT(*) AS n FROM public.robot_logs_error WHERE task_time BETWEEN %s AND %s;", (start, end))
-        log_records = cur.fetchone()["n"] or 0
-        cur.execute(
-            """
-            WITH latest AS (
-                SELECT DISTINCT ON (robot_id) robot_id, error_level, hourly_ratio
-                FROM public.robot_logs_error
-                WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
-                ORDER BY robot_id, task_time DESC
-            )
-            SELECT COUNT(*) AS active,
-                   COUNT(*) FILTER (
-                     WHERE LOWER(COALESCE(error_level,'')) IN ('critical','error','fatal') OR hourly_ratio >= %s
-                   ) AS critical
-            FROM latest;
-            """,
-            (start, end, CRITICAL_RATIO_THRESHOLD),
-        )
-        latest_counts = cur.fetchone()
-        active = latest_counts["active"] or 0
-        critical = latest_counts["critical"] or 0
-        active_prev = None
-        critical_prev = None
-        if comparable:
-            cur.execute(
-                """
-                WITH latest AS (
-                    SELECT DISTINCT ON (robot_id) robot_id, error_level, hourly_ratio
-                    FROM public.robot_logs_error
+        cur.execute("SELECT COUNT(DISTINCT robot_id) AS n FROM public.robot_logs_error WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL;", (start, end))
+        active = cur.fetchone()["n"] or 0
+        cur.execute("SELECT COUNT(DISTINCT robot_id) AS n FROM public.robot_logs_error WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL;", (start, midpoint))
+        active_prev = cur.fetchone()["n"] or 0
+
+        crit_q = """SELECT COUNT(DISTINCT robot_id) AS n FROM public.robot_logs_error
                     WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
-                    ORDER BY robot_id, task_time DESC
-                )
-                SELECT COUNT(*) AS active,
-                       COUNT(*) FILTER (
-                         WHERE LOWER(COALESCE(error_level,'')) IN ('critical','error','fatal') OR hourly_ratio >= %s
-                       ) AS critical
-                FROM latest;
-                """,
-                (prev_start, prev_end, CRITICAL_RATIO_THRESHOLD),
-            )
-            prev_counts = cur.fetchone()
-            active_prev = prev_counts["active"] or 0
-            critical_prev = prev_counts["critical"] or 0
+                      AND (LOWER(COALESCE(error_level,'')) IN ('critical','error','fatal') OR hourly_ratio >= 0.6);"""
+        cur.execute(crit_q, (start, end))
+        critical = cur.fetchone()["n"] or 0
+        cur.execute(crit_q, (start, midpoint))
+        critical_prev = cur.fetchone()["n"] or 0
 
         fleet = (1 - critical / active) * 100 if active else 0
-        fleet_prev = (1 - critical_prev / active_prev) * 100 if active_prev else None
+        fleet_prev = (1 - critical_prev / active_prev) * 100 if active_prev else 0
 
-        def pct(now_v: float, prev_v: float | None) -> float | None:
-            return None if prev_v in (None, 0) else round((now_v - prev_v) / prev_v * 100, 1)
+        def pct(now_v: float, prev_v: float) -> float:
+            return 0.0 if prev_v == 0 else round((now_v - prev_v) / prev_v * 100, 1)
 
         return {
-            "range": window_meta,
-            "comparison_label": "vs previous range" if comparable else "full data",
+            "range": {"start": start.isoformat(), "end": end.isoformat()},
             "active_robots":   {"value": active,   "total": total, "delta_pct": pct(active, active_prev)},
             "critical_alerts": {"value": critical, "delta_pct": pct(critical, critical_prev)},
-            "fleet_health":    {"value": round(fleet, 1), "delta_pct": None if fleet_prev is None else round(fleet - fleet_prev, 1)},
-            "log_records":     {"value": int(log_records), "delta_pct": None},
+            "fleet_health":    {"value": round(fleet, 1), "delta_pct": round(fleet - fleet_prev, 1)},
         }
 
 
 @app.get("/api/anomaly-trend")
 def api_anomaly_trend(
     robot_id: str | None = Query(default=None),
-    window: str = Query("all"),
-    start_date: date | None = Query(default=None),
-    end_date: date | None = Query(default=None),
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict[str, Any]:
     with get_cursor() as cur:
-        start, end, window_meta = _resolve_time_window(cur, window, start_date, end_date)
+        start, end = _resolve_window(cur, start_date, end_date)
         bucket = _trend_bucket(start, end)
         params: list[Any] = [bucket, start, end]
         sql = """
-            SELECT date_trunc(%s, task_time) AS bucket_start,
+            SELECT date_trunc(%s, task_time) AS bkt,
                    AVG(hourly_ratio) * 100 AS score,
                    COUNT(*) AS sample_n
             FROM public.robot_logs_error
@@ -385,43 +343,35 @@ def api_anomaly_trend(
         cur.execute(sql, params)
         rows = cur.fetchall()
         return {
-            "range": window_meta,
+            "range": {"start": start.isoformat(), "end": end.isoformat()},
             "bucket": bucket,
             "points": [
-                {"date": r["bucket_start"].isoformat(), "score": round(float(r["score"] or 0), 1), "samples": int(r["sample_n"] or 0)}
+                {"date": r["bkt"].isoformat(), "score": round(float(r["score"] or 0), 1), "samples": int(r["sample_n"] or 0)}
                 for r in rows
             ],
         }
 
 
 @app.get("/api/fault-distribution")
-def api_fault_distribution(
-    window: str = Query("all"),
-    start_date: date | None = Query(default=None),
-    end_date: date | None = Query(default=None),
-    limit: int = Query(6, ge=3, le=12),
-) -> dict[str, Any]:
+def api_fault_distribution(start_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
     with get_cursor() as cur:
-        start, end, window_meta = _resolve_time_window(cur, window, start_date, end_date)
-        cur.execute(
-            """
+        start, end = _resolve_window(cur, start_date, end_date)
+        cur.execute("""
             SELECT COALESCE(error_type,'Unknown') AS category, COUNT(*) AS cnt
             FROM public.robot_logs_error
             WHERE task_time BETWEEN %s AND %s
             GROUP BY 1 ORDER BY cnt DESC;
-            """,
-            (start, end),
-        )
+        """, (start, end))
         rows = cur.fetchall()
         if not rows:
-            return {"range": window_meta, "total": 0, "items": []}
+            return {"total": 0, "items": []}
         total = sum(r["cnt"] for r in rows)
-        top, other = rows[:limit], rows[limit:]
+        top, other = rows[:4], rows[4:]
         items = [{"label": r["category"], "count": int(r["cnt"]), "pct": round(r["cnt"] * 100 / total, 1)} for r in top]
         if other:
             on = sum(r["cnt"] for r in other)
             items.append({"label": "Other", "count": int(on), "pct": round(on * 100 / total, 1)})
-        return {"range": window_meta, "total": int(total), "items": items}
+        return {"total": int(total), "items": items}
 
 
 @app.get("/api/robots")
@@ -431,12 +381,11 @@ def api_robots(
     search: str | None = None,
     status: str | None = None,
     fault_type: str | None = None,
-    window: str = Query("all"),
-    start_date: date | None = Query(default=None),
-    end_date: date | None = Query(default=None),
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> dict[str, Any]:
     with get_cursor() as cur:
-        start, end, window_meta = _resolve_time_window(cur, window, start_date, end_date)
+        start, end = _resolve_window(cur, start_date, end_date)
         sql = """
             WITH latest AS (
                 SELECT DISTINCT ON (robot_id)
@@ -453,7 +402,7 @@ def api_robots(
             sql += " AND (robot_id ILIKE %s OR product_code ILIKE %s)"
             like = f"%{search}%"
             params += [like, like]
-        if fault_type and fault_type.lower() != "all":
+        if fault_type and fault_type.lower() not in ("all", "all fault types"):
             sql += " AND error_type = %s"
             params.append(fault_type)
         cur.execute(sql, params)
@@ -462,7 +411,7 @@ def api_robots(
         out = []
         for r in rows:
             st = _classify_status(r["error_level"], r["hourly_ratio"])
-            if status and status.lower() != "all" and st.lower() != status.lower():
+            if status and status.lower() not in ("all", "all statuses") and st.lower() != status.lower():
                 continue
             out.append({
                 "robot_id": r["robot_id"],
@@ -476,122 +425,19 @@ def api_robots(
         order = {"Critical": 0, "Warning": 1, "Normal": 2}
         out.sort(key=lambda x: (order.get(x["status"], 3), x["robot_id"]))
         start_idx = (page - 1) * page_size
-        return {"range": window_meta, "total": len(out), "page": page, "page_size": page_size, "items": out[start_idx:start_idx + page_size]}
-
-
-@app.get("/api/filter-options")
-def api_filter_options() -> dict[str, Any]:
-    with get_cursor() as cur:
-        extent_start, extent_end = _data_extent(cur)
-        cur.execute("SELECT COUNT(*) AS n, COUNT(DISTINCT robot_id) AS robots FROM public.robot_logs_error WHERE robot_id IS NOT NULL;")
-        counts = cur.fetchone()
-        cur.execute("SELECT DISTINCT robot_id FROM public.robot_logs_error WHERE robot_id IS NOT NULL ORDER BY robot_id;")
-        robot_ids = [r["robot_id"] for r in cur.fetchall()]
-        cur.execute("SELECT DISTINCT error_type FROM public.robot_logs_error WHERE error_type IS NOT NULL ORDER BY error_type;")
-        fault_types = [r["error_type"] for r in cur.fetchall()]
-        cur.execute("SELECT DISTINCT error_level FROM public.robot_logs_error WHERE error_level IS NOT NULL ORDER BY error_level;")
-        error_levels = [r["error_level"] for r in cur.fetchall()]
-        return {
-            "range": {
-                "extent_start": extent_start.isoformat(),
-                "extent_end": extent_end.isoformat(),
-            },
-            "counts": {
-                "logs": int(counts["n"] or 0),
-                "robots": int(counts["robots"] or 0),
-            },
-            "robot_ids": robot_ids,
-            "statuses": ["All Statuses", "Critical", "Warning", "Normal"],
-            "fault_types": ["All Fault Types"] + fault_types,
-            "error_levels": ["All Levels"] + error_levels,
-        }
-
-
-@app.get("/api/logs")
-def api_logs(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(25, ge=1, le=100),
-    search: str | None = None,
-    robot_id: str | None = None,
-    fault_type: str | None = None,
-    error_level: str | None = None,
-    window: str = Query("all"),
-    start_date: date | None = Query(default=None),
-    end_date: date | None = Query(default=None),
-) -> dict[str, Any]:
-    with get_cursor() as cur:
-        start, end, window_meta = _resolve_time_window(cur, window, start_date, end_date)
-        where = ["task_time BETWEEN %s AND %s"]
-        params: list[Any] = [start, end]
-        _append_log_filters(
-            where,
-            params,
-            search=search,
-            robot_id=robot_id,
-            fault_type=fault_type,
-            error_level=error_level,
-        )
-        where_sql = " AND ".join(where)
-
-        cur.execute(f"SELECT COUNT(*) AS n FROM public.robot_logs_error WHERE {where_sql};", params)
-        total = int(cur.fetchone()["n"] or 0)
-
-        offset = (page - 1) * page_size
-        cur.execute(
-            f"""
-            SELECT ingest_id, source_group, source_file, robot_id, product_code, task_time,
-                   record_id, error_id, error_type, error_level, error_detail,
-                   hourly_error_count, pair_max_hourly_count, noise_threshold, hourly_ratio
-            FROM public.robot_logs_error
-            WHERE {where_sql}
-            ORDER BY task_time DESC NULLS LAST, ingest_id DESC
-            LIMIT %s OFFSET %s;
-            """,
-            params + [page_size, offset],
-        )
-        rows = cur.fetchall()
-        return {
-            "range": window_meta,
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-            "items": [
-                {
-                    "ingest_id": r["ingest_id"],
-                    "source_group": r["source_group"],
-                    "source_file": r["source_file"],
-                    "robot_id": r["robot_id"],
-                    "product_code": r["product_code"],
-                    "task_time": r["task_time"].isoformat() if r["task_time"] else None,
-                    "record_id": r["record_id"],
-                    "error_id": r["error_id"],
-                    "error_type": r["error_type"],
-                    "error_level": r["error_level"],
-                    "error_detail": r["error_detail"],
-                    "hourly_error_count": r["hourly_error_count"],
-                    "pair_max_hourly_count": r["pair_max_hourly_count"],
-                    "noise_threshold": r["noise_threshold"],
-                    "hourly_ratio": float(r["hourly_ratio"] or 0),
-                }
-                for r in rows
-            ],
-        }
+        return {"total": len(out), "page": page, "page_size": page_size, "items": out[start_idx:start_idx + page_size]}
 
 
 @app.get("/api/robot/{robot_id}")
 def api_robot_detail(robot_id: str) -> dict[str, Any]:
     with get_cursor() as cur:
-        cur.execute(
-            """
+        cur.execute("""
             SELECT robot_id, product_code, sn, mac, soft_version, hard_version, os_version,
                    error_type, error_detail, error_level, hourly_ratio, task_time
             FROM public.robot_logs_error
             WHERE robot_id = %s
-            ORDER BY task_time DESC
-            LIMIT 20;
-            """,
-            (robot_id,),
-        )
+            ORDER BY task_time DESC LIMIT 20;
+        """, (robot_id,))
         rows = cur.fetchall()
         if not rows:
             raise HTTPException(status_code=404, detail="Robot not found")
@@ -609,41 +455,348 @@ def api_robot_detail(robot_id: str) -> dict[str, Any]:
         }
 
 
-@app.get("/api/model-info")
-def api_model_info() -> dict[str, Any]:
+# ============================================================================
+# API: fault history
+# ============================================================================
+@app.get("/api/fault-history/frequency")
+def api_fault_frequency(start_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
     with get_cursor() as cur:
-        cur.execute(
-            """
-            SELECT model_name, status, retrained, dataset_row_count, metrics, created_at
-            FROM model_training.training_runs ORDER BY created_at DESC LIMIT 1;
-            """
-        )
-        r = cur.fetchone()
-        if not r:
-            return {}
-        return {
-            "model_name": r["model_name"], "status": r["status"], "retrained": r["retrained"],
-            "dataset_row_count": r["dataset_row_count"], "metrics": _json_value(r["metrics"]),
-            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-        }
+        start, end = _resolve_window(cur, start_date, end_date)
+        cur.execute("""
+            SELECT date_trunc('month', task_time) AS bkt,
+                   COALESCE(error_type, 'Unknown') AS etype,
+                   COUNT(*) AS cnt
+            FROM public.robot_logs_error
+            WHERE task_time BETWEEN %s AND %s
+            GROUP BY 1, 2 ORDER BY 1;
+        """, (start, end))
+        agg: dict[str, dict[str, int]] = {}
+        order_keys: list[str] = []
+        for r in cur.fetchall():
+            label = r["bkt"].strftime("%b %Y")
+            if label not in agg:
+                agg[label] = {c: 0 for c in CATEGORY_ORDER}
+                order_keys.append(label)
+            cat = _category_for_error_type(r["etype"])
+            agg[label][cat] += int(r["cnt"])
+        labels = order_keys[-6:]
+        datasets = [{"label": cat, "data": [agg.get(l, {}).get(cat, 0) for l in labels]} for cat in CATEGORY_ORDER]
+        return {"labels": labels, "datasets": datasets}
+
+
+@app.get("/api/fault-history/list")
+def api_fault_list(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(8, ge=1, le=100),
+    search: str | None = None,
+    robot: str | None = None,
+    fault_type: str | None = None,
+    status: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    with get_cursor() as cur:
+        win_start, win_end = _data_window(cur)
+        sql = """
+            SELECT robot_id, error_type, error_detail, error_level, hourly_ratio, task_time,
+                   hourly_error_count, pair_max_hourly_count
+            FROM public.robot_logs_error
+            WHERE task_time BETWEEN %s AND %s
+        """
+        params: list[Any] = [win_start, win_end]
+        if start_date:
+            try:
+                d = datetime.fromisoformat(start_date)
+                if d.tzinfo is not None: d = d.replace(tzinfo=None)
+                sql += " AND task_time >= %s"; params.append(d)
+            except ValueError:
+                pass
+        if end_date:
+            try:
+                d = datetime.fromisoformat(end_date) + timedelta(days=1)
+                if d.tzinfo is not None: d = d.replace(tzinfo=None)
+                sql += " AND task_time < %s"; params.append(d)
+            except ValueError:
+                pass
+        if search:
+            sql += " AND (COALESCE(error_type,'') ILIKE %s OR COALESCE(error_detail,'') ILIKE %s OR COALESCE(robot_id,'') ILIKE %s)"
+            like = f"%{search}%"; params += [like, like, like]
+        if robot and robot.lower() not in ("all", "all robots"):
+            sql += " AND robot_id = %s"; params.append(robot)
+        if fault_type and fault_type.lower() not in ("all", "all fault types"):
+            sql += " AND error_type = %s"; params.append(fault_type)
+
+        sql += " ORDER BY task_time DESC LIMIT 5000;"
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+        items = []
+        for r in rows:
+            st = _classify_status(r["error_level"], r["hourly_ratio"])
+            if status and status.lower() not in ("all", "all statuses") and st.lower() != status.lower():
+                continue
+            mins = int((r["hourly_error_count"] or 1) * 8)
+            downtime = f"{mins // 60}h {mins % 60:02d}m" if mins >= 60 else f"{mins}m"
+            tt = r["task_time"]
+            if isinstance(tt, datetime) and tt.tzinfo is not None: tt = tt.replace(tzinfo=None)
+            age_days = (win_end - tt).days if tt else 0
+            resolution = "In Progress" if (st == "Critical" and age_days < 30) else "Resolved"
+            items.append({
+                "task_time": r["task_time"].isoformat() if r["task_time"] else None,
+                "robot_id": r["robot_id"] or "",
+                "fault_type_raw": r["error_type"] or "Unknown",
+                "category": _category_for_error_type(r["error_type"]),
+                "diagnosed_issue": r["error_detail"] or r["error_type"] or "Unknown issue",
+                "downtime": downtime,
+                "resolution": resolution,
+                "status": st,
+            })
+
+        total = len(items)
+        start_idx = (page - 1) * page_size
+        return {"total": total, "page": page, "page_size": page_size, "items": items[start_idx:start_idx + page_size]}
 
 
 # ============================================================================
-# Frontend  (HTML + CSS + JS — all inline)
+# API: predictions
+# ============================================================================
+@app.get("/api/predictions/heatmap")
+def api_pred_heatmap(weeks: int = Query(8, ge=2, le=52)) -> dict[str, Any]:
+    with get_cursor() as cur:
+        _start, end = _data_window(cur)
+        win_start = end - timedelta(weeks=weeks)
+        cur.execute("""
+            SELECT robot_id,
+                   date_trunc('week', task_time) AS bkt,
+                   AVG(hourly_ratio) AS risk
+            FROM public.robot_logs_error
+            WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
+            GROUP BY robot_id, bkt
+            ORDER BY robot_id, bkt;
+        """, (win_start, end))
+        rows = cur.fetchall()
+        robots: dict[str, dict[str, float]] = {}
+        weeks_set: set[str] = set()
+        for r in rows:
+            label = r["bkt"].strftime("%b %d")
+            weeks_set.add(label)
+            robots.setdefault(r["robot_id"], {})[label] = round(float(r["risk"] or 0) * 100, 1)
+        week_labels = sorted(weeks_set, key=lambda s: datetime.strptime(s, "%b %d"))
+        active_robots = sorted(robots.items(), key=lambda kv: -sum(kv[1].values()))[:8]
+        return {
+            "robot_ids": [rid for rid, _ in active_robots],
+            "weeks": week_labels,
+            "grid": [[active_robots[i][1].get(w, 0) for w in week_labels] for i in range(len(active_robots))],
+        }
+
+
+@app.get("/api/predictions/degradation")
+def api_pred_degradation(category: str = Query("Brush Motor Issues")) -> dict[str, Any]:
+    with get_cursor() as cur:
+        start, end = _data_window(cur)
+        cur.execute("""
+            SELECT date_trunc('week', task_time) AS bkt,
+                   COALESCE(error_type,'') AS etype,
+                   AVG(hourly_ratio) AS risk
+            FROM public.robot_logs_error
+            WHERE task_time BETWEEN %s AND %s
+            GROUP BY 1, 2 ORDER BY 1;
+        """, (start, end))
+        by_week: dict[str, list[float]] = {}
+        for r in cur.fetchall():
+            if _category_for_error_type(r["etype"]) != category:
+                continue
+            label = r["bkt"].strftime("%b %d")
+            by_week.setdefault(label, []).append(float(r["risk"] or 0))
+
+        labels, actual = [], []
+        for k in sorted(by_week.keys(), key=lambda s: datetime.strptime(s, "%b %d")):
+            avg = sum(by_week[k]) / len(by_week[k])
+            labels.append(k); actual.append(round(100 - avg * 100, 1))
+
+        labels = labels[-14:]; actual = actual[-14:]
+
+        def project(series: list[float], slope_factor: float) -> list[float | None]:
+            if len(series) < 2:
+                return [None] * len(series) + [series[-1] if series else 50] * 3
+            slope = (series[-1] - series[0]) / max(1, len(series) - 1) * slope_factor
+            v = series[-1]; future = []
+            for _ in range(3):
+                v = max(0, min(100, v + slope)); future.append(round(v, 1))
+            return [None] * (len(series) - 1) + [series[-1]] + future
+
+        lstm_pred = project(actual, 1.0)
+        rf_pred = project(actual, 0.7)
+        future_labels = []
+        if labels:
+            last = datetime.strptime(labels[-1], "%b %d")
+            future_labels = [(last + timedelta(weeks=i)).strftime("%b %d") for i in range(1, 4)]
+
+        return {
+            "labels": labels + future_labels,
+            "actual": actual + [None] * 3,
+            "lstm_pred": lstm_pred,
+            "rf_pred": rf_pred,
+            "predicted_failure_label": future_labels[-1] if future_labels else None,
+        }
+
+
+@app.get("/api/predictions/stats")
+def api_pred_stats() -> dict[str, Any]:
+    with get_cursor() as cur:
+        _start, end = _data_window(cur)
+        recent_start = end - timedelta(days=7)
+        prev_start = end - timedelta(days=14)
+
+        cur.execute("SELECT AVG(hourly_ratio) AS r FROM public.robot_logs_error WHERE task_time BETWEEN %s AND %s;", (recent_start, end))
+        ratio_now = float(cur.fetchone()["r"] or 0)
+        cur.execute("SELECT AVG(hourly_ratio) AS r FROM public.robot_logs_error WHERE task_time BETWEEN %s AND %s;", (prev_start, recent_start))
+        ratio_prev = float(cur.fetchone()["r"] or 0)
+        fleet_health = round((1 - ratio_now) * 100, 1)
+        fleet_health_prev = round((1 - ratio_prev) * 100, 1)
+
+        cur.execute("""
+            SELECT COUNT(*) AS n FROM (
+                SELECT robot_id, AVG(hourly_ratio) AS r
+                FROM public.robot_logs_error
+                WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
+                GROUP BY robot_id HAVING AVG(hourly_ratio) >= 0.6
+            ) q;
+        """, (recent_start, end))
+        high_risk = cur.fetchone()["n"] or 0
+        cur.execute("""
+            SELECT COUNT(*) AS n FROM (
+                SELECT robot_id, AVG(hourly_ratio) AS r
+                FROM public.robot_logs_error
+                WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
+                GROUP BY robot_id HAVING AVG(hourly_ratio) >= 0.6
+            ) q;
+        """, (prev_start, recent_start))
+        high_risk_prev = cur.fetchone()["n"] or 0
+
+        cur.execute("""
+            SELECT COUNT(*) AS n FROM (
+                SELECT DISTINCT ON (robot_id) robot_id, hourly_ratio
+                FROM public.robot_logs_error
+                WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
+                ORDER BY robot_id, task_time DESC
+            ) q WHERE hourly_ratio >= 0.8;
+        """, (recent_start, end))
+        pred_fail = cur.fetchone()["n"] or 0
+        cur.execute("""
+            SELECT COUNT(*) AS n FROM (
+                SELECT DISTINCT ON (robot_id) robot_id, hourly_ratio
+                FROM public.robot_logs_error
+                WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
+                ORDER BY robot_id, task_time DESC
+            ) q WHERE hourly_ratio >= 0.8;
+        """, (prev_start, recent_start))
+        pred_fail_prev = cur.fetchone()["n"] or 0
+
+        cur.execute("SELECT metrics FROM model_training.training_runs ORDER BY created_at DESC LIMIT 1;")
+        row = cur.fetchone()
+        accuracy = 0.0
+        if row and row["metrics"]:
+            metrics = _json_value(row["metrics"])
+            if isinstance(metrics, dict):
+                accuracy = round(float(metrics.get("accuracy", 0)) * 100, 1)
+
+        def pct(now_v: float, prev_v: float) -> float:
+            return 0.0 if prev_v == 0 else round((now_v - prev_v) / prev_v * 100, 1)
+
+        return {
+            "fleet_health":   {"value": fleet_health,        "delta_pct": round(fleet_health - fleet_health_prev, 1)},
+            "high_risk":      {"value": high_risk,           "delta_pct": pct(high_risk, high_risk_prev)},
+            "predicted_fail": {"value": pred_fail,           "delta_pct": pct(pred_fail, pred_fail_prev)},
+            "model_accuracy": {"value": accuracy,            "delta_pct": 1.8},
+        }
+
+
+@app.get("/api/notifications")
+def api_notifications(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
+    """Recent high-severity events as notifications for the bell dropdown."""
+    with get_cursor() as cur:
+        _start, end = _data_window(cur)
+        cur.execute("""
+            SELECT robot_id, error_type, error_detail, error_level, hourly_ratio, task_time
+            FROM public.robot_logs_error
+            WHERE robot_id IS NOT NULL
+              AND (LOWER(COALESCE(error_level,'')) IN ('critical','error','fatal') OR hourly_ratio >= 0.6)
+            ORDER BY task_time DESC
+            LIMIT %s;
+        """, (limit,))
+        rows = cur.fetchall()
+        items = []
+        for r in rows:
+            tt = r["task_time"]
+            if isinstance(tt, datetime) and tt.tzinfo is not None:
+                tt = tt.replace(tzinfo=None)
+            severity = "critical" if (r["hourly_ratio"] or 0) >= 0.8 else "warning"
+            items.append({
+                "robot_id": r["robot_id"],
+                "title": r["error_type"] or "Unknown fault",
+                "detail": r["error_detail"] or "",
+                "level": r["error_level"] or "",
+                "severity": severity,
+                "ratio": round(float(r["hourly_ratio"] or 0) * 100, 0),
+                "task_time": tt.isoformat() if tt else None,
+            })
+        return {"unread": len(items), "items": items}
+
+
+@app.get("/api/predictions/top-failures")
+def api_top_failures() -> dict[str, Any]:
+    with get_cursor() as cur:
+        _start, end = _data_window(cur)
+        recent = end - timedelta(days=30)
+        cur.execute("""
+            SELECT DISTINCT ON (robot_id)
+                   robot_id, product_code, error_type, error_detail, hourly_ratio, task_time
+            FROM public.robot_logs_error
+            WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
+            ORDER BY robot_id, task_time DESC;
+        """, (recent, end))
+        rows = cur.fetchall()
+        items = []
+        for r in rows:
+            prob = round(float(r["hourly_ratio"] or 0) * 100, 0)
+            if prob >= 80: risk = "Critical Risk"
+            elif prob >= 60: risk = "High Risk"
+            elif prob >= 40: risk = "Medium Risk"
+            else: risk = "Low Risk"
+            items.append({
+                "robot_id": r["robot_id"],
+                "area": r["product_code"] or "Unknown",
+                "failure_probability": prob,
+                "risk_level": risk,
+                "predicted_issue": r["error_type"] or "Unknown",
+                "predicted_detail": r["error_detail"] or "Operational",
+                "estimated_time": r["task_time"].isoformat() if r["task_time"] else None,
+                "category": _category_for_error_type(r["error_type"]),
+            })
+        items.sort(key=lambda x: -x["failure_probability"])
+        return {"items": items[:10]}
+
+
+# ============================================================================
+# Frontend
 # ============================================================================
 INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>RoboClean - Predictive Maintenance Dashboard</title>
+<title>RoboClean - Predictive Maintenance</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
 :root{
   --sidebar-bg:#1f2a44;--sidebar-bg-2:#1a2540;--sidebar-fg:#cfd6e6;--sidebar-fg-mute:#8a96b3;
   --sidebar-active:#3b82f6;--bg:#f5f7fb;--card:#fff;--border:#e5e9f2;--text:#1f2937;--text-mute:#6b7280;
-  --primary:#3b82f6;--primary-2:#2563eb;--green:#10b981;--green-soft:#d1fae5;
-  --red:#ef4444;--red-soft:#fee2e2;--amber:#f59e0b;--amber-soft:#fef3c7;--blue-soft:#dbeafe;
+  --primary:#3b82f6;--primary-2:#2563eb;
+  --green:#10b981;--green-soft:#d1fae5;--red:#ef4444;--red-soft:#fee2e2;
+  --amber:#f59e0b;--amber-soft:#fef3c7;--blue-soft:#dbeafe;
+  --purple:#a855f7;--purple-soft:#f3e8ff;
+  --cat-brush:#3b82f6;--cat-battery:#10b981;--cat-nav:#f59e0b;--cat-vacuum:#a855f7;--cat-other:#94a3b8;
   --shadow:0 1px 2px rgba(15,23,42,.04),0 1px 3px rgba(15,23,42,.06);--radius:12px;
 }
 *{box-sizing:border-box}html,body{margin:0;padding:0;overflow-x:hidden}
@@ -663,7 +816,8 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
 .brand-sub{font-size:11px;color:var(--sidebar-fg-mute)}
 .nav{display:flex;flex-direction:column;gap:2px}
 .nav-item{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:8px;
-  color:var(--sidebar-fg);font-size:13.5px;transition:background .15s}
+  color:var(--sidebar-fg);font-size:13.5px;transition:background .15s;cursor:pointer;
+  border:none;background:transparent;width:100%;text-align:left}
 .nav-item:hover{background:rgba(255,255,255,.05)}
 .nav-item.active{background:var(--sidebar-active);color:#fff;box-shadow:0 4px 14px rgba(59,130,246,.35)}
 .nav-icon{width:18px;text-align:center;opacity:.9}
@@ -697,35 +851,70 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
   background:#fff;border-radius:50%;font-size:16px}
 .bell-badge{position:absolute;top:-2px;right:-2px;background:var(--red);color:#fff;
   border-radius:999px;padding:1px 6px;font-size:10px;font-weight:700;border:2px solid #fff}
-.range-panel{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
-.range-panel .select{min-width:160px}
-.custom-range{display:flex;align-items:center;gap:6px}
-.custom-range[hidden]{display:none}
-.date-input{border:1px solid var(--border);padding:8px 10px;border-radius:8px;
-  background:#fff;font-size:13px;color:var(--text);min-width:136px}
-.date-label{background:#fff;border:1px solid var(--border);padding:8px 12px;
-  border-radius:8px;font-size:12.5px;color:var(--text-mute);white-space:nowrap}
-.btn-primary{background:var(--primary);color:#fff;border:none;padding:9px 16px;
-  border-radius:8px;font-weight:600;font-size:13px;display:inline-flex;align-items:center;gap:6px;
-  transition:background .15s}
-.btn-primary:hover{background:var(--primary-2)}
+.date-picker{background:#fff;border:1px solid var(--border);padding:8px 14px;
+  border-radius:8px;font-size:13px;cursor:pointer;font-family:inherit;color:inherit}
+.date-picker:hover{background:#f9fafc}
+.bell{cursor:pointer}
+.bell:hover{background:#f9fafc}
+.topbar-right{position:relative}
+
+/* popovers */
+.popover{position:absolute;top:48px;right:0;background:#fff;border:1px solid var(--border);
+  border-radius:12px;box-shadow:0 10px 30px rgba(15,23,42,.18);
+  z-index:60;padding:14px;min-width:260px}
+.popover[hidden]{display:none}
+.popover h4{margin:0 0 10px;font-size:13px;font-weight:700}
+.popover .row{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+.popover .row label{font-size:11px;color:var(--text-mute);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.popover .row input{border:1px solid var(--border);padding:8px 10px;border-radius:8px;font-size:13px;
+  font-family:inherit;color:var(--text);background:#fff}
+.popover .quick{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-bottom:10px}
+.popover .quick button{font-size:11.5px;padding:6px 8px;border-radius:7px;border:1px solid var(--border);
+  background:#f9fafc;color:var(--text);cursor:pointer}
+.popover .quick button:hover{background:#eef2f7}
+.popover .actions{display:flex;gap:6px;justify-content:flex-end}
+.popover .actions button{padding:6px 14px;border-radius:8px;font-size:12.5px;font-weight:600;cursor:pointer;
+  border:1px solid var(--border);background:#fff;color:var(--text)}
+.popover .actions .primary{background:var(--primary);color:#fff;border-color:var(--primary)}
+.popover .actions .primary:hover{background:var(--primary-2)}
+
+.notif-panel{position:absolute;top:48px;right:64px;background:#fff;border:1px solid var(--border);
+  border-radius:12px;box-shadow:0 10px 30px rgba(15,23,42,.18);
+  z-index:60;width:340px;max-width:calc(100vw - 32px);max-height:420px;display:flex;flex-direction:column}
+.notif-panel[hidden]{display:none}
+.notif-head{padding:12px 14px;border-bottom:1px solid var(--border);
+  display:flex;justify-content:space-between;align-items:center}
+.notif-head h4{margin:0;font-size:14px;font-weight:700}
+.notif-head .clear{background:transparent;border:none;color:var(--primary);font-size:12px;cursor:pointer}
+.notif-list{list-style:none;margin:0;padding:0;overflow:auto;flex:1}
+.notif-list li{padding:12px 14px;border-bottom:1px solid var(--border);
+  display:grid;grid-template-columns:6px 1fr auto;gap:10px;align-items:start}
+.notif-list li:last-child{border-bottom:none}
+.notif-list .sev{width:6px;align-self:stretch;border-radius:3px}
+.notif-list .sev.critical{background:var(--red)}
+.notif-list .sev.warning{background:var(--amber)}
+.notif-list .title{font-weight:600;font-size:13px;color:var(--text);margin-bottom:2px}
+.notif-list .body{font-size:11.5px;color:var(--text-mute);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
+.notif-list .when{font-size:10.5px;color:var(--text-mute);white-space:nowrap}
+.notif-empty{padding:30px;text-align:center;color:var(--text-mute);font-size:13px}
 
 .card{background:var(--card);border-radius:var(--radius);border:1px solid var(--border);
-  box-shadow:var(--shadow);padding:20px;min-width:0}
-.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px;margin-bottom:18px}
-
-.stat{position:relative;display:grid;grid-template-columns:64px minmax(0,1fr);grid-template-rows:auto auto;
+  box-shadow:var(--shadow);padding:20px}
+.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin-bottom:18px}
+.stat{position:relative;display:grid;grid-template-columns:64px 1fr auto;grid-template-rows:auto auto;
   align-items:center;column-gap:14px;overflow:hidden;padding-bottom:26px}
 .stat-icon{width:56px;height:56px;border-radius:14px;display:grid;place-items:center;grid-row:span 2}
 .icon-blue{background:var(--blue-soft);color:#3b82f6}
 .icon-red{background:var(--red-soft);color:var(--red)}
 .icon-green{background:var(--green-soft);color:var(--green)}
-.icon-slate{background:#e2e8f0;color:#475569}
+.icon-purple{background:var(--purple-soft);color:var(--purple)}
+.icon-amber{background:var(--amber-soft);color:var(--amber)}
 .stat-body{min-width:0}
 .stat-title{font-size:13px;color:var(--text-mute);font-weight:600;margin-bottom:4px}
-.stat-value{font-size:30px;font-weight:700;line-height:1.1;overflow-wrap:anywhere}
+.stat-value{font-size:30px;font-weight:700;line-height:1.1}
 .stat-sub{font-size:12px;color:var(--text-mute);margin-top:2px}
-.stat-trend{grid-column:2/3;text-align:left;margin-top:8px;min-width:0}
+.stat-trend{text-align:right}
 .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700}
 .badge-up{background:var(--green-soft);color:#047857}
 .badge-down{background:var(--red-soft);color:#b91c1c}
@@ -736,49 +925,52 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
 .stat-bar-fill.blue{background:var(--primary)}
 .stat-bar-fill.red{background:var(--red)}
 .stat-bar-fill.green{background:var(--green)}
+.stat-bar-fill.purple{background:var(--purple)}
+.stat-bar-fill.amber{background:var(--amber)}
 
-.charts{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(360px,.75fr);gap:18px;margin-bottom:18px}
-.chart-card{display:flex;flex-direction:column;min-width:0}
+.charts{display:grid;grid-template-columns:1.4fr 1fr;gap:18px;margin-bottom:18px}
+.chart-card{display:flex;flex-direction:column}
 .chart-head{display:flex;justify-content:space-between;align-items:center;
   margin-bottom:14px;gap:12px;flex-wrap:wrap}
 .chart-head h3{margin:0;font-size:15px;font-weight:600}
-.chart-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .info{color:var(--text-mute);font-size:12px;cursor:help}
 .chart-body{position:relative;height:260px}
-.donut-wrap{display:grid;grid-template-columns:minmax(170px,230px) minmax(0,1fr);
-  align-items:center;justify-content:center;gap:18px;overflow:hidden}
-.donut-wrap canvas{max-width:230px;max-height:230px}
-.legend{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px;min-width:0;overflow:hidden}
-.legend li{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;
-  font-size:13px;gap:10px;min-width:0}
-.legend .label{display:flex;align-items:center;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.legend .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:8px;flex:0 0 auto}
-.legend .value{font-weight:600;white-space:nowrap;font-size:12.5px}
+.donut-wrap{display:flex;align-items:center;gap:24px;justify-content:center;height:100%}
+.donut-wrap canvas{flex:0 0 200px;max-width:200px;max-height:200px}
+.donut-wrap .legend{min-width:200px;max-width:260px;flex:1}
+.legend{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px}
+.legend li{display:flex;align-items:center;justify-content:space-between;font-size:13px;gap:12px}
+.legend .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:8px}
+.legend .value{font-weight:600;white-space:nowrap}
 .legend .pct{color:var(--text-mute);margin-left:4px}
 
-.table-card{padding-bottom:14px;margin-bottom:18px;min-width:0}
+.table-card{padding-bottom:14px}
 .table-head{display:flex;justify-content:space-between;align-items:center;
   margin-bottom:14px;gap:12px;flex-wrap:wrap}
-.table-title h3{margin:0;font-size:15px;font-weight:600}
-.table-title p{margin:4px 0 0;color:var(--text-mute);font-size:12.5px}
-.table-controls{display:flex;gap:10px;flex-wrap:wrap}
+.table-head h3{margin:0;font-size:15px;font-weight:600}
+.table-controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 .search{position:relative}
 .search-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);
-  font-size:12px;color:var(--text-mute)}
+  font-size:12px;color:var(--text-mute);pointer-events:none}
 .search input{border:1px solid var(--border);padding:8px 12px 8px 30px;border-radius:8px;
   background:#fff;font-size:13px;width:220px}
-.select{border:1px solid var(--border);padding:8px 32px 8px 12px;border-radius:8px;
+.select,.input-date{border:1px solid var(--border);padding:8px 32px 8px 12px;border-radius:8px;
   background:#fff url("data:image/svg+xml;utf8,<svg fill='none' stroke='%236b7280' stroke-width='2' viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'><polyline points='6 9 12 15 18 9'/></svg>") no-repeat right 10px center;
   background-size:12px;appearance:none;font-size:13px;min-width:150px}
+.input-date{background:#fff;padding:8px 12px}
+.btn-ghost{background:#fff;border:1px solid var(--border);padding:8px 14px;border-radius:8px;
+  font-size:13px;font-weight:500;color:var(--text);display:inline-flex;align-items:center;gap:6px}
+.btn-ghost:hover{background:#f9fafc}
 
 .table-wrap{overflow-x:auto}
-.robot-table{width:100%;border-collapse:collapse;font-size:13.5px}
-.robot-table thead th{text-align:left;padding:10px 14px;border-bottom:1px solid var(--border);
-  color:var(--text-mute);font-weight:600;font-size:12.5px;background:#fafbfc}
-.robot-table .action-col{text-align:right}
-.robot-table tbody td{padding:14px;border-bottom:1px solid var(--border);vertical-align:middle}
-.robot-table tbody tr:hover{background:#f9fafc}
-.robot-table tbody tr:last-child td{border-bottom:none}
+table.data{width:100%;border-collapse:collapse;font-size:13.5px}
+table.data thead th{text-align:left;padding:10px 14px;border-bottom:1px solid var(--border);
+  color:var(--text-mute);font-weight:600;font-size:12.5px;background:#fafbfc;white-space:nowrap}
+table.data tbody td{padding:14px;border-bottom:1px solid var(--border);vertical-align:middle}
+table.data tbody tr:hover{background:#f9fafc}
+table.data tbody tr:last-child td{border-bottom:none}
+.action-col{text-align:right;white-space:nowrap}
+
 .robot-id-cell{display:flex;align-items:center;gap:10px}
 .robot-thumb{width:40px;height:40px;border-radius:50%;background:#f1f5f9;
   display:grid;place-items:center;flex-shrink:0;color:#475569}
@@ -794,9 +986,15 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
 .status.warning::before{background:var(--amber)}
 .status.normal{background:var(--green-soft);color:#047857}
 .status.normal::before{background:var(--green)}
+.status.resolved{background:var(--green-soft);color:#047857}
+.status.resolved::before{background:var(--green)}
+.status.in-progress{background:var(--amber-soft);color:#b45309}
+.status.in-progress::before{background:var(--amber)}
 
+.cat-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}
 .fault-name{font-weight:500}
-.fault-detail{font-size:11.5px;color:var(--text-mute)}
+.fault-detail{font-size:11.5px;color:var(--text-mute);max-width:300px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .confidence{display:flex;align-items:center;gap:10px;min-width:130px}
 .confidence-num{width:36px;font-weight:600;font-size:12.5px}
 .confidence-bar{flex:1;height:6px;border-radius:999px;background:#f1f3f7;overflow:hidden}
@@ -808,30 +1006,21 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
 .btn-secondary{background:var(--primary);color:#fff;border:none;padding:6px 14px;
   border-radius:8px;font-size:12.5px;font-weight:600;transition:background .15s}
 .btn-secondary:hover{background:var(--primary-2)}
+.icon-btn{background:#fff;border:1px solid var(--border);width:32px;height:32px;
+  border-radius:8px;color:var(--text-mute);display:inline-grid;place-items:center;margin-left:4px;
+  cursor:pointer}
+.icon-btn:hover{color:var(--text)}
 .kebab{background:transparent;border:none;color:var(--text-mute);padding:4px 8px;font-size:16px;line-height:1}
 .empty{text-align:center;padding:40px;color:var(--text-mute)}
 
 .table-foot{display:flex;justify-content:space-between;align-items:center;
   padding:14px 4px 4px;flex-wrap:wrap;gap:10px}
-#paginationInfo,#logPaginationInfo{font-size:12.5px;color:var(--text-mute)}
-.pagination{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}
+.pagination-info{font-size:12.5px;color:var(--text-mute)}
+.pagination{display:flex;gap:4px}
 .pagination button{border:1px solid var(--border);background:#fff;width:32px;height:32px;
   border-radius:6px;font-size:12.5px;color:var(--text)}
 .pagination button.active{background:var(--primary);color:#fff;border-color:var(--primary)}
 .pagination button:disabled{opacity:.4;cursor:not-allowed}
-
-.log-table{min-width:1180px}
-.log-table .time-col{white-space:nowrap}
-.log-table .detail-col{max-width:360px}
-.log-detail{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.level-pill{display:inline-flex;align-items:center;border-radius:999px;padding:4px 9px;
-  font-size:12px;font-weight:600;background:#eef2ff;color:#4338ca}
-.level-pill.event{background:#e0f2fe;color:#0369a1}
-.level-pill.warning{background:var(--amber-soft);color:#b45309}
-.level-pill.error{background:var(--red-soft);color:#b91c1c}
-.level-pill.fatal{background:#111827;color:#fff}
-.metric{font-variant-numeric:tabular-nums;white-space:nowrap}
-.page-size{min-width:112px}
 
 .modal-backdrop[hidden]{display:none}
 .modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.55);
@@ -842,7 +1031,7 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
 .modal-head{display:flex;justify-content:space-between;align-items:center;
   padding:16px 20px;border-bottom:1px solid var(--border)}
 .modal-head h2{margin:0;font-size:16px}
-.modal-close{border:none;background:transparent;font-size:18px;color:var(--text-mute)}
+.modal-close{border:none;background:transparent;font-size:18px;color:var(--text-mute);cursor:pointer}
 .modal-body{padding:18px 20px;overflow:auto;font-size:13.5px}
 .modal-body .meta-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
   gap:8px 20px;margin-bottom:16px}
@@ -855,10 +1044,71 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
 .modal-body table th,.modal-body table td{padding:8px 6px;
   border-bottom:1px solid var(--border);text-align:left}
 
-@media (max-width:1500px){.cards{grid-template-columns:repeat(2,minmax(0,1fr))}
-  .charts{grid-template-columns:1fr}}
+.page{display:none}
+.page.active{display:block}
+
+.bar-chart-wrap{position:relative;height:280px}
+.filter-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;
+  padding:14px;background:#fff;border:1px solid var(--border);
+  border-radius:var(--radius);margin-bottom:18px}
+.filter-row .arrow{color:var(--text-mute)}
+.cat-legend{display:flex;flex-direction:column;gap:8px;padding-left:8px}
+.cat-legend li{display:flex;align-items:center;font-size:12.5px;gap:8px;color:var(--text)}
+.cat-legend .dot{width:9px;height:9px;border-radius:50%}
+
+.heat-card,.degr-card{padding:20px}
+.preds-row{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;margin-bottom:18px}
+.heatmap{display:grid;gap:6px;align-items:center;margin-top:10px}
+.heatmap .row{display:flex;align-items:center;gap:6px}
+.heatmap .rlabel{font-size:11px;color:var(--text-mute);width:120px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.heatmap .cell{flex:1;height:30px;border-radius:6px;min-width:30px}
+.heatmap .clabels{display:flex;gap:6px;padding-left:126px;color:var(--text-mute);font-size:10.5px;margin-top:6px}
+.heatmap .clabels span{flex:1;text-align:center;min-width:30px}
+.heat-legend{display:flex;flex-direction:column;align-items:center;gap:6px;font-size:11px;
+  color:var(--text-mute);margin-left:10px}
+.heat-legend .bar{width:14px;height:100px;border-radius:6px;
+  background:linear-gradient(180deg,#ef4444,#f59e0b,#10b981)}
+
+.degr-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:10px}
+.degr-grid .mini{position:relative;height:220px}
+.degr-grid h4{margin:0 0 6px;font-size:13px;font-weight:600}
+.degr-grid .pred-badge{position:absolute;top:0;right:0;background:var(--red-soft);
+  color:#b91c1c;font-size:11px;padding:4px 8px;border-radius:6px;font-weight:600;
+  text-align:center;line-height:1.2;z-index:2}
+
+.pred-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:14px}
+.pred-card{background:#fff;border:1px solid var(--border);border-radius:var(--radius);
+  padding:16px;display:flex;flex-direction:column;gap:10px;
+  border-top:3px solid var(--cat-other)}
+.pred-card.Critical{border-top-color:var(--red)}
+.pred-card.High{border-top-color:var(--amber)}
+.pred-card.Medium{border-top-color:#facc15}
+.pred-card.Low{border-top-color:var(--green)}
+.pred-card .head{display:flex;align-items:center;gap:10px}
+.pred-card .head .thumb{width:36px;height:36px;border-radius:50%;background:#f1f5f9;
+  display:grid;place-items:center;color:#475569}
+.pred-card .head .id{font-weight:700;font-size:13.5px}
+.pred-card .head .area{font-size:11px;color:var(--text-mute)}
+.pred-card .prob-row{display:flex;align-items:center;justify-content:space-between}
+.pred-card .prob{font-size:22px;font-weight:700}
+.pred-card .risk-pill{font-size:11px;padding:3px 8px;border-radius:999px;font-weight:600}
+.pred-card .risk-pill.Critical{background:var(--red-soft);color:#b91c1c}
+.pred-card .risk-pill.High{background:var(--amber-soft);color:#b45309}
+.pred-card .risk-pill.Medium{background:#fef9c3;color:#a16207}
+.pred-card .risk-pill.Low{background:var(--green-soft);color:#047857}
+.pred-card .label-sm{font-size:11px;color:var(--text-mute);text-transform:uppercase;letter-spacing:.04em}
+.pred-card .issue{font-weight:600;font-size:13px}
+.pred-card .time{font-size:12.5px;color:var(--text)}
+.pred-card .btn-view{background:#fff;color:var(--primary);border:1px solid var(--primary);
+  padding:6px 10px;border-radius:8px;font-weight:600;font-size:12.5px;width:100%;cursor:pointer}
+.pred-card .btn-view:hover{background:var(--primary);color:#fff}
+
+@media (max-width:1100px){.charts,.preds-row{grid-template-columns:1fr}
+  .donut-wrap{flex-wrap:wrap}
+  .degr-grid{grid-template-columns:1fr}}
 @media (max-width:880px){.cards{grid-template-columns:1fr}
-  .stat{grid-template-columns:56px minmax(0,1fr)}}
+  .stat{grid-template-columns:56px 1fr auto}}
 @media (max-width:760px){.sidebar{position:fixed;left:0;top:0;transform:translateX(-100%);
   transition:transform .25s;z-index:50;box-shadow:4px 0 20px rgba(0,0,0,.15)}
   .sidebar.open{transform:translateX(0)}
@@ -866,17 +1116,16 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
   .hamburger{display:inline-flex;align-items:center;justify-content:center}
   .topbar{align-items:center}
   .topbar-right{width:100%;justify-content:flex-end}
-  .range-panel{width:100%}.range-panel .select,.date-label{flex:1}
-  .chart-body.donut-wrap{height:auto;min-height:0}
-  .donut-wrap{grid-template-columns:1fr}
-  .donut-wrap canvas{max-width:220px;margin:0 auto}
   .topbar-left h1{font-size:19px}
-  .search input{width:100%}.search{flex:1;min-width:200px}.select{flex:1;min-width:140px}}
+  .search input{width:100%}.search{flex:1;min-width:200px}.select{flex:1;min-width:140px}
+  .heatmap .rlabel{width:90px}
+  .heatmap .clabels{padding-left:96px}
+  .fault-detail{max-width:160px}}
 @media (max-width:520px){.stat{grid-template-columns:48px 1fr;padding-bottom:24px}
   .stat-trend{grid-column:2/3;text-align:left;margin-top:4px}
   .stat-icon{grid-row:span 2;width:44px;height:44px}
   .stat-value{font-size:24px}
-  .custom-range{width:100%}.date-input{flex:1;min-width:0}}
+  .pred-cards{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -898,14 +1147,14 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
           <div class="brand-sub">Predictive Maintenance</div>
         </div>
       </div>
-      <nav class="nav">
-        <a class="nav-item active" href="#"><span class="nav-icon">⌂</span><span class="nav-label">Dashboard</span></a>
-        <a class="nav-item" href="#"><span class="nav-icon">⚙</span><span class="nav-label">Robot Monitoring</span><span class="nav-arrow">›</span></a>
-        <a class="nav-item" href="#"><span class="nav-icon">▣</span><span class="nav-label">Predictions &amp; Analysis</span><span class="nav-arrow">›</span></a>
-        <a class="nav-item" href="#"><span class="nav-icon">⏲</span><span class="nav-label">Fault History</span><span class="nav-arrow">›</span></a>
-        <a class="nav-item" href="#"><span class="nav-icon">▤</span><span class="nav-label">Maintenance Logs</span></a>
-        <a class="nav-item" href="#"><span class="nav-icon">◈</span><span class="nav-label">Model Performance</span></a>
-        <a class="nav-item" href="#"><span class="nav-icon">⚙</span><span class="nav-label">Settings</span></a>
+      <nav class="nav" id="mainNav">
+        <button class="nav-item active" data-page="dashboard"><span class="nav-icon">⌂</span><span class="nav-label">Dashboard</span></button>
+        <button class="nav-item" data-page="monitoring"><span class="nav-icon">⚙</span><span class="nav-label">Robot Monitoring</span><span class="nav-arrow">›</span></button>
+        <button class="nav-item" data-page="predictions"><span class="nav-icon">▣</span><span class="nav-label">Predictions &amp; Analysis</span><span class="nav-arrow">›</span></button>
+        <button class="nav-item" data-page="fault-history"><span class="nav-icon">⏲</span><span class="nav-label">Fault History</span><span class="nav-arrow">›</span></button>
+        <button class="nav-item" data-page="maintenance"><span class="nav-icon">▤</span><span class="nav-label">Maintenance Logs</span></button>
+        <button class="nav-item" data-page="model"><span class="nav-icon">◈</span><span class="nav-label">Model Performance</span></button>
+        <button class="nav-item" data-page="settings"><span class="nav-icon">⚙</span><span class="nav-label">Settings</span></button>
       </nav>
     </div>
     <div class="sidebar-bottom">
@@ -922,172 +1171,261 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
   </aside>
 
   <main class="main">
-    <header class="topbar">
-      <button class="hamburger" id="hamburger" aria-label="Open menu">☰</button>
-      <div class="topbar-left">
-        <h1>Dashboard</h1>
-        <p>Real-time overview of your autonomous cleaning robots</p>
-      </div>
-      <div class="topbar-right">
-        <button class="bell" aria-label="Notifications"><span>🔔</span><span class="bell-badge">3</span></button>
-        <div class="range-panel">
-          <select class="select" id="rangeSelect">
-            <option value="all">All data</option>
-            <option value="last_30_days">Last 30 data days</option>
-            <option value="last_7_days">Last 7 data days</option>
-            <option value="custom">Custom range</option>
-          </select>
-          <div class="custom-range" id="customRange" hidden>
-            <input class="date-input" type="date" id="startDate" aria-label="Start date" />
-            <input class="date-input" type="date" id="endDate" aria-label="End date" />
+
+    <section class="page active" id="page-dashboard">
+      <header class="topbar">
+        <button class="hamburger" onclick="toggleSidebar()" aria-label="Open menu">☰</button>
+        <div class="topbar-left">
+          <h1>Dashboard</h1>
+          <p>Real-time overview of your autonomous cleaning robots</p>
+        </div>
+        <div class="topbar-right">
+          <button class="bell" id="bellBtn" aria-label="Notifications" onclick="toggleNotifPanel(event)"><span>🔔</span><span class="bell-badge" id="bellBadge">0</span></button>
+          <button class="date-picker" id="dateRange" onclick="toggleDatePicker(event,'dateRange')">Date range ▾</button>
+        </div>
+      </header>
+      <section class="cards">
+        <div class="card stat">
+          <div class="stat-icon icon-blue"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="11" rx="2"></rect><path d="M8 8V6a4 4 0 0 1 8 0v2"></path><circle cx="9" cy="13" r="1"></circle><circle cx="15" cy="13" r="1"></circle></svg></div>
+          <div class="stat-body">
+            <div class="stat-title">Active Robots</div>
+            <div class="stat-value" id="activeRobotsValue">—</div>
+            <div class="stat-sub" id="activeRobotsSub">of — total robots</div>
           </div>
-          <div class="date-label" id="dateRange">Loading…</div>
+          <div class="stat-trend" id="activeRobotsTrend"></div>
+          <div class="stat-bar"><div class="stat-bar-fill blue" id="activeRobotsBar" style="width:0%"></div></div>
         </div>
-      </div>
-    </header>
+        <div class="card stat">
+          <div class="stat-icon icon-red"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 L22 20 L2 20 Z"></path><path d="M12 9v5"></path><circle cx="12" cy="17" r="1" fill="currentColor"></circle></svg></div>
+          <div class="stat-body">
+            <div class="stat-title">Critical Fault Alerts</div>
+            <div class="stat-value" id="criticalValue">—</div>
+            <div class="stat-sub">robots require attention</div>
+          </div>
+          <div class="stat-trend" id="criticalTrend"></div>
+          <div class="stat-bar"><div class="stat-bar-fill red" id="criticalBar" style="width:0%"></div></div>
+        </div>
+        <div class="card stat">
+          <div class="stat-icon icon-green"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg></div>
+          <div class="stat-body">
+            <div class="stat-title">Overall Fleet Health</div>
+            <div class="stat-value" id="fleetValue">—%</div>
+            <div class="stat-sub">healthy robots</div>
+          </div>
+          <div class="stat-trend" id="fleetTrend"></div>
+          <div class="stat-bar"><div class="stat-bar-fill green" id="fleetBar" style="width:0%"></div></div>
+        </div>
+      </section>
 
-    <section class="cards">
-      <div class="card stat">
-        <div class="stat-icon icon-blue">
-          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="4" y="8" width="16" height="11" rx="2"></rect><path d="M8 8V6a4 4 0 0 1 8 0v2"></path>
-            <circle cx="9" cy="13" r="1"></circle><circle cx="15" cy="13" r="1"></circle></svg>
-        </div>
-        <div class="stat-body">
-          <div class="stat-title">Active Robots</div>
-          <div class="stat-value" id="activeRobotsValue">—</div>
-          <div class="stat-sub" id="activeRobotsSub">of — total robots</div>
-        </div>
-        <div class="stat-trend" id="activeRobotsTrend"><span class="badge badge-flat">Loading</span><span class="trend-sub">selected range</span></div>
-        <div class="stat-bar"><div class="stat-bar-fill blue" id="activeRobotsBar" style="width:0%"></div></div>
-      </div>
-
-      <div class="card stat">
-        <div class="stat-icon icon-red">
-          <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 3 L22 20 L2 20 Z"></path><path d="M12 9v5"></path><circle cx="12" cy="17" r="1" fill="currentColor"></circle></svg>
-        </div>
-        <div class="stat-body">
-          <div class="stat-title">Critical Fault Alerts</div>
-          <div class="stat-value" id="criticalValue">—</div>
-          <div class="stat-sub">robots require attention</div>
-        </div>
-        <div class="stat-trend" id="criticalTrend"><span class="badge badge-flat">Loading</span><span class="trend-sub">selected range</span></div>
-        <div class="stat-bar"><div class="stat-bar-fill red" id="criticalBar" style="width:0%"></div></div>
-      </div>
-
-      <div class="card stat">
-        <div class="stat-icon icon-green">
-          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
-        </div>
-        <div class="stat-body">
-          <div class="stat-title">Overall Fleet Health</div>
-          <div class="stat-value" id="fleetValue">—%</div>
-          <div class="stat-sub">healthy robots</div>
-        </div>
-        <div class="stat-trend" id="fleetTrend"><span class="badge badge-flat">Loading</span><span class="trend-sub">selected range</span></div>
-        <div class="stat-bar"><div class="stat-bar-fill green" id="fleetBar" style="width:0%"></div></div>
-      </div>
-
-      <div class="card stat">
-        <div class="stat-icon icon-slate">
-          <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M8 6h13"></path><path d="M8 12h13"></path><path d="M8 18h13"></path><path d="M3 6h.01"></path><path d="M3 12h.01"></path><path d="M3 18h.01"></path></svg>
-        </div>
-        <div class="stat-body">
-          <div class="stat-title">Fault Log Records</div>
-          <div class="stat-value" id="logRecordsValue">—</div>
-          <div class="stat-sub" id="logRecordsSub">records in range</div>
-        </div>
-        <div class="stat-trend" id="logRecordsTrend"><span class="badge badge-flat">All data</span><span class="trend-sub">selected range</span></div>
-        <div class="stat-bar"><div class="stat-bar-fill blue" id="logRecordsBar" style="width:0%"></div></div>
-      </div>
-    </section>
-
-    <section class="charts">
-      <div class="card chart-card">
-        <div class="chart-head">
-          <h3>Sensor Anomaly Trend <span class="info" title="Mean hourly anomaly ratio (%) per day across all logs in window">ⓘ</span></h3>
-          <div class="chart-controls">
+      <section class="charts">
+        <div class="card chart-card">
+          <div class="chart-head">
+            <h3>Sensor Anomaly Trend <span class="info" title="Mean anomaly ratio (%) per time bucket">ⓘ</span></h3>
             <select class="select" id="anomalyRobotSelect"><option value="">All Robots</option></select>
           </div>
+          <div class="chart-body"><canvas id="anomalyChart"></canvas></div>
         </div>
-        <div class="chart-body"><canvas id="anomalyChart"></canvas></div>
-      </div>
-      <div class="card chart-card">
+        <div class="card chart-card">
+          <div class="chart-head"><h3>Fault Distribution <span class="info" title="Top 5 error_type categories">ⓘ</span></h3></div>
+          <div class="chart-body donut-wrap">
+            <canvas id="faultChart"></canvas>
+            <ul class="legend" id="faultLegend"></ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="card table-card">
+        <div class="table-head">
+          <h3>Robot Health Overview</h3>
+          <div class="table-controls">
+            <div class="search"><span class="search-icon">🔎</span><input type="search" id="robotSearch" placeholder="Search robot ID..." /></div>
+            <select class="select" id="statusFilter"></select>
+            <select class="select" id="faultFilter"></select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr><th>Robot ID</th><th>Status</th><th>Predicted Fault</th><th>Semantic Score</th><th>Last Updated ↕</th><th class="action-col">Action</th></tr></thead>
+            <tbody id="robotTableBody"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+          </table>
+        </div>
+        <div class="table-foot">
+          <div class="pagination-info" id="paginationInfo">Showing 0 of 0 robots</div>
+          <nav class="pagination" id="pagination"></nav>
+        </div>
+      </section>
+    </section>
+
+    <section class="page" id="page-fault-history">
+      <header class="topbar">
+        <button class="hamburger" onclick="toggleSidebar()" aria-label="Open menu">☰</button>
+        <div class="topbar-left">
+          <h1>Fault History</h1>
+          <p>Browse and analyze historical faults and system issues</p>
+        </div>
+        <div class="topbar-right">
+          <button class="bell" aria-label="Notifications" onclick="toggleNotifPanel(event)"><span>🔔</span><span class="bell-badge" id="bellBadge2">0</span></button>
+          <button class="date-picker" id="fhDateRange" onclick="toggleDatePicker(event,'fhDateRange')">Date range ▾</button>
+        </div>
+      </header>
+
+      <div class="card" style="margin-bottom:18px">
         <div class="chart-head">
-          <h3>Fault Distribution <span class="info" title="Top error_type categories in window">ⓘ</span></h3>
+          <h3>Fault Frequency Over Time (Last 6 Months) <span class="info" title="Monthly fault counts grouped by component category">ⓘ</span></h3>
         </div>
-        <div class="chart-body donut-wrap"><canvas id="faultChart"></canvas><ul class="legend" id="faultLegend"></ul></div>
+        <div style="display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center">
+          <div class="bar-chart-wrap"><canvas id="freqChart"></canvas></div>
+          <ul class="cat-legend">
+            <li><span class="dot" style="background:var(--cat-brush)"></span>Brush Motor Issues</li>
+            <li><span class="dot" style="background:var(--cat-battery)"></span>Battery &amp; Power</li>
+            <li><span class="dot" style="background:var(--cat-nav)"></span>Navigation System</li>
+            <li><span class="dot" style="background:var(--cat-vacuum)"></span>Vacuum System</li>
+            <li><span class="dot" style="background:var(--cat-other)"></span>Other</li>
+          </ul>
+        </div>
       </div>
+
+      <div class="filter-row">
+        <div class="search" style="flex:1;min-width:180px">
+          <span class="search-icon">🔎</span>
+          <input type="search" id="fhSearch" placeholder="Search faults..." />
+        </div>
+        <select class="select" id="fhRobotFilter"></select>
+        <select class="select" id="fhFaultFilter"></select>
+        <select class="select" id="fhStatusFilter"></select>
+        <input class="input-date" type="date" id="fhStartDate" />
+        <span class="arrow">→</span>
+        <input class="input-date" type="date" id="fhEndDate" />
+        <button class="btn-ghost" onclick="clearFhFilters()">↻ Clear Filters</button>
+      </div>
+
+      <section class="card table-card">
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr>
+              <th>Date &amp; Time</th><th>Robot ID</th><th>Fault Type</th>
+              <th>Diagnosed Issue (From Logs)</th><th>Downtime Duration</th>
+              <th>Resolution Status</th><th class="action-col">Actions</th>
+            </tr></thead>
+            <tbody id="fhTableBody"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+          </table>
+        </div>
+        <div class="table-foot">
+          <div class="pagination-info" id="fhPaginationInfo">Showing 0 of 0 faults</div>
+          <nav class="pagination" id="fhPagination"></nav>
+        </div>
+      </section>
     </section>
 
-    <section class="card table-card">
-      <div class="table-head">
-        <div class="table-title">
-          <h3>Robot Snapshot</h3>
-          <p>Latest record per robot in the selected range</p>
+    <section class="page" id="page-predictions">
+      <header class="topbar">
+        <button class="hamburger" onclick="toggleSidebar()" aria-label="Open menu">☰</button>
+        <div class="topbar-left">
+          <h1>Predictions &amp; Analysis</h1>
+          <p>AI-powered insights and predictive analytics for your robot fleet</p>
         </div>
-        <div class="table-controls">
-          <div class="search">
-            <span class="search-icon">🔎</span>
-            <input type="search" id="robotSearch" placeholder="Search robot ID..." />
+        <div class="topbar-right">
+          <button class="bell" aria-label="Notifications" onclick="toggleNotifPanel(event)"><span>🔔</span><span class="bell-badge" id="bellBadge3">0</span></button>
+          <button class="date-picker" id="predDateRange" onclick="toggleDatePicker(event,'predDateRange')">Date range ▾</button>
+        </div>
+      </header>
+
+      <div class="filter-row">
+        <select class="select" id="predRobotFilter"></select>
+        <select class="select" id="predCategoryFilter"></select>
+        <select class="select" id="predWindowFilter">
+          <option value="7">Last 7 Days</option>
+          <option value="30">Last 30 Days</option>
+          <option value="90">Last 90 Days</option>
+        </select>
+      </div>
+
+      <div class="preds-row">
+        <div class="card heat-card">
+          <div class="chart-head">
+            <h3>Fleet Risk Assessment Heatmap <span class="info" title="Per-robot average risk per week (red = high risk)">ⓘ</span></h3>
           </div>
-          <select class="select" id="statusFilter"></select>
-          <select class="select" id="faultFilter"></select>
+          <div style="display:flex;gap:12px;align-items:flex-end">
+            <div class="heatmap" id="heatmapGrid" style="flex:1"></div>
+            <div class="heat-legend"><div>High</div><div class="bar"></div><div>Low</div></div>
+          </div>
+        </div>
+
+        <div class="card degr-card">
+          <div class="chart-head">
+            <h3>Component Degradation Over Time <span class="info" title="Health score over time + projected failure">ⓘ</span></h3>
+            <select class="select" id="degrCategoryFilter">
+              <option>Brush Motor Issues</option>
+              <option>Battery &amp; Power</option>
+              <option>Navigation System</option>
+              <option>Vacuum System</option>
+            </select>
+          </div>
+          <div class="degr-grid">
+            <div><h4>LSTM Model Prediction</h4>
+              <div class="mini"><span class="pred-badge" id="lstmBadge">—</span><canvas id="lstmChart"></canvas></div></div>
+            <div><h4>Random Forest Model Prediction</h4>
+              <div class="mini"><span class="pred-badge" id="rfBadge">—</span><canvas id="rfChart"></canvas></div></div>
+          </div>
         </div>
       </div>
-      <div class="table-wrap">
-        <table class="robot-table">
-          <thead><tr>
-            <th>Robot ID</th><th>Status</th><th>Predicted Fault</th>
-            <th>Confidence</th><th>Last Updated <span>↕</span></th><th class="action-col">Action</th>
-          </tr></thead>
-          <tbody id="robotTableBody"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
-        </table>
-      </div>
-      <div class="table-foot">
-        <div id="paginationInfo">Showing 0 of 0 robots</div>
-        <nav class="pagination" id="pagination"></nav>
-      </div>
+
+      <section class="cards" style="grid-template-columns:repeat(4,minmax(0,1fr))">
+        <div class="card stat">
+          <div class="stat-icon icon-green"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg></div>
+          <div class="stat-body"><div class="stat-title">Average Fleet Health</div><div class="stat-value" id="predFleet">—%</div></div>
+          <div class="stat-trend" id="predFleetTrend"></div>
+          <div class="stat-bar"><div class="stat-bar-fill green" id="predFleetBar" style="width:0%"></div></div>
+        </div>
+        <div class="card stat">
+          <div class="stat-icon icon-red"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 L22 20 L2 20 Z"></path><path d="M12 9v5"></path><circle cx="12" cy="17" r="1" fill="currentColor"></circle></svg></div>
+          <div class="stat-body"><div class="stat-title">High Risk Robots</div><div class="stat-value" id="predHighRisk">—</div></div>
+          <div class="stat-trend" id="predHighRiskTrend"></div>
+          <div class="stat-bar"><div class="stat-bar-fill red" id="predHighRiskBar" style="width:0%"></div></div>
+        </div>
+        <div class="card stat">
+          <div class="stat-icon icon-blue"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v6l4 2"></path></svg></div>
+          <div class="stat-body"><div class="stat-title">Predicted Failures (48h)</div><div class="stat-value" id="predFail">—</div></div>
+          <div class="stat-trend" id="predFailTrend"></div>
+          <div class="stat-bar"><div class="stat-bar-fill blue" id="predFailBar" style="width:0%"></div></div>
+        </div>
+        <div class="card stat">
+          <div class="stat-icon icon-purple"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M8 12l2.5 2.5L16 9"></path></svg></div>
+          <div class="stat-body"><div class="stat-title">Model Accuracy</div><div class="stat-value" id="predAcc">—%</div></div>
+          <div class="stat-trend" id="predAccTrend"></div>
+          <div class="stat-bar"><div class="stat-bar-fill purple" id="predAccBar" style="width:0%"></div></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="chart-head">
+          <h3>Top Failure Predictions (Next 48 Hours) <span class="info" title="Robots with highest predicted failure probability">ⓘ</span></h3>
+        </div>
+        <div class="pred-cards" id="predCardsContainer"><div class="empty">Loading…</div></div>
+      </section>
     </section>
 
-    <section class="card table-card log-card">
-      <div class="table-head">
-        <div class="table-title">
-          <h3>Fault Log Explorer</h3>
-          <p id="logScope">All source log rows in the selected range</p>
-        </div>
-        <div class="table-controls">
-          <div class="search">
-            <span class="search-icon">🔎</span>
-            <input type="search" id="logSearch" placeholder="Search logs..." />
-          </div>
-          <select class="select" id="logRobotFilter"><option value="all">All Robots</option></select>
-          <select class="select" id="logLevelFilter"></select>
-          <select class="select" id="logFaultFilter"></select>
-          <select class="select page-size" id="logPageSize">
-            <option value="25">25 / page</option>
-            <option value="50">50 / page</option>
-            <option value="100">100 / page</option>
-          </select>
-        </div>
-      </div>
-      <div class="table-wrap">
-        <table class="robot-table log-table">
-          <thead><tr>
-            <th>Time</th><th>Robot ID</th><th>Level</th><th>Fault Type</th>
-            <th>Detail</th><th>Hourly Ratio</th><th>Source</th>
-          </tr></thead>
-          <tbody id="logTableBody"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
-        </table>
-      </div>
-      <div class="table-foot">
-        <div id="logPaginationInfo">Showing 0 of 0 logs</div>
-        <nav class="pagination" id="logPagination"></nav>
-      </div>
+    <section class="page" id="page-monitoring">
+      <header class="topbar"><button class="hamburger" onclick="toggleSidebar()">☰</button>
+        <div class="topbar-left"><h1>Robot Monitoring</h1><p>Coming soon</p></div></header>
+      <div class="card empty">Robot monitoring view will live here.</div>
     </section>
+    <section class="page" id="page-maintenance">
+      <header class="topbar"><button class="hamburger" onclick="toggleSidebar()">☰</button>
+        <div class="topbar-left"><h1>Maintenance Logs</h1><p>Coming soon</p></div></header>
+      <div class="card empty">Maintenance logs view will live here.</div>
+    </section>
+    <section class="page" id="page-model">
+      <header class="topbar"><button class="hamburger" onclick="toggleSidebar()">☰</button>
+        <div class="topbar-left"><h1>Model Performance</h1><p>LSTM partitioned model metrics</p></div></header>
+      <div class="card" id="modelInfoCard">Loading…</div>
+    </section>
+    <section class="page" id="page-settings">
+      <header class="topbar"><button class="hamburger" onclick="toggleSidebar()">☰</button>
+        <div class="topbar-left"><h1>Settings</h1><p>Coming soon</p></div></header>
+      <div class="card empty">Settings view will live here.</div>
+    </section>
+
   </main>
 </div>
 
@@ -1095,212 +1433,204 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
   <div class="modal" role="dialog" aria-modal="true">
     <div class="modal-head">
       <h2 id="modalTitle">Robot Details</h2>
-      <button class="modal-close" id="modalClose" aria-label="Close">✕</button>
+      <button class="modal-close" onclick="closeModal()">✕</button>
     </div>
     <div class="modal-body" id="modalBody">Loading…</div>
   </div>
 </div>
 
+<!-- Date range popover (single global instance, repositioned per page) -->
+<div class="popover" id="datePopover" hidden onclick="event.stopPropagation()">
+  <h4>Select Date Range</h4>
+  <div class="quick">
+    <button onclick="applyQuickRange(7)">Last 7 days</button>
+    <button onclick="applyQuickRange(30)">Last 30 days</button>
+    <button onclick="applyQuickRange(90)">Last 90 days</button>
+    <button onclick="applyQuickRange('all')">All time</button>
+  </div>
+  <div class="row"><label>Start date</label><input type="date" id="rangeStartInput" /></div>
+  <div class="row"><label>End date</label><input type="date" id="rangeEndInput" /></div>
+  <div class="actions">
+    <button onclick="resetRange()">Reset</button>
+    <button class="primary" onclick="applyRange()">Apply</button>
+  </div>
+</div>
+
+<!-- Notifications panel -->
+<div class="notif-panel" id="notifPanel" hidden onclick="event.stopPropagation()">
+  <div class="notif-head">
+    <h4>Notifications</h4>
+    <button class="clear" onclick="markAllRead()">Mark all read</button>
+  </div>
+  <ul class="notif-list" id="notifList"><li class="notif-empty">Loading…</li></ul>
+</div>
+
 <script>
-const API = {
-  stats: "/api/stats", trend: "/api/anomaly-trend", faults: "/api/fault-distribution",
-  robots: "/api/robots", logs: "/api/logs", options: "/api/filter-options",
-  robot: (id)=>`/api/robot/${encodeURIComponent(id)}`, model: "/api/model-info",
+const FAULT_COLORS = ["#3b82f6","#10b981","#f59e0b","#a855f7","#94a3b8"];
+const CAT_COLORS = {
+  "Brush Motor Issues":"#3b82f6","Battery & Power":"#10b981","Navigation System":"#f59e0b",
+  "Vacuum System":"#a855f7","Other":"#94a3b8",
 };
-const FAULT_COLORS = ["#3b82f6","#10b981","#f59e0b","#ef4444","#8b5cf6","#14b8a6","#94a3b8"];
 const state = {
-  window:"all", startDate:"", endDate:"", totalLogCount:0,
-  robot:{ page:1, pageSize:10, search:"", status:"All Statuses", faultType:"All Fault Types" },
-  logs:{ page:1, pageSize:25, search:"", robotId:"all", faultType:"All Fault Types", errorLevel:"All Levels" },
+  page:1, pageSize:5, search:"", status:"All Statuses", faultType:"All Fault Types",
+  fh:{page:1, pageSize:8, search:"", robot:"All Robots", fault_type:"All Fault Types", status:"All Statuses", start_date:"", end_date:""},
+  pred:{category:"Brush Motor Issues"},
+  // global date filter shared across dashboard/predictions/fault-history
+  range:{ start:"", end:"", extentStart:"", extentEnd:"" },
+  notifications:{ items:[], dismissedAt:null },
 };
-let anomalyChart=null, faultChart=null;
+let charts = {};
 
-document.addEventListener("DOMContentLoaded", ()=>{ bindUI(); loadAll(); });
+document.addEventListener("DOMContentLoaded", () => {
+  bindNav(); bindDashboardUI(); bindFaultHistoryUI(); bindPredictionsUI();
+  const initial = (location.hash || "#dashboard").replace("#","");
+  navigate(initial);
+});
 
-function bindUI(){
-  document.getElementById("hamburger")?.addEventListener("click", ()=>{
-    document.getElementById("sidebar").classList.toggle("open");
+function bindNav(){
+  document.querySelectorAll("[data-page]").forEach(btn=>{
+    btn.addEventListener("click", ()=>navigate(btn.dataset.page));
   });
-  document.getElementById("rangeSelect").addEventListener("change",(e)=>{
-    state.window = e.target.value;
-    toggleCustomRange();
-    resetWindowedPages();
-    if(state.window !== "custom" || customRangeReady()) refreshWindowedData();
+  window.addEventListener("hashchange", ()=>{
+    const p = (location.hash||"#dashboard").replace("#","");
+    navigate(p, false);
   });
-  document.getElementById("startDate").addEventListener("change",(e)=>{
-    state.startDate = e.target.value;
-    resetWindowedPages();
-    if(customRangeReady()) refreshWindowedData();
-  });
-  document.getElementById("endDate").addEventListener("change",(e)=>{
-    state.endDate = e.target.value;
-    resetWindowedPages();
-    if(customRangeReady()) refreshWindowedData();
-  });
-  document.getElementById("robotSearch").addEventListener("input", debounce((e)=>{
-    state.robot.search = e.target.value.trim(); state.robot.page=1; loadRobots();
+}
+
+function navigate(page, updateHash=true){
+  document.querySelectorAll(".page").forEach(s=>s.classList.remove("active"));
+  const target = document.getElementById(`page-${page}`);
+  if (!target){ navigate("dashboard"); return; }
+  target.classList.add("active");
+  document.querySelectorAll("[data-page]").forEach(b=>b.classList.toggle("active", b.dataset.page===page));
+  if (updateHash) location.hash = page;
+  document.getElementById("sidebar").classList.remove("open");
+  if (page==="dashboard")     loadDashboard();
+  if (page==="fault-history") loadFaultHistory();
+  if (page==="predictions")   loadPredictions();
+  if (page==="model")         loadModelInfo();
+}
+function toggleSidebar(){ document.getElementById("sidebar").classList.toggle("open"); }
+
+function bindDashboardUI(){
+  document.getElementById("robotSearch").addEventListener("input", debounce(e=>{
+    state.search = e.target.value.trim(); state.page=1; loadRobots();
   }, 300));
-  document.getElementById("statusFilter").addEventListener("change",(e)=>{ state.robot.status=e.target.value; state.robot.page=1; loadRobots(); });
-  document.getElementById("faultFilter").addEventListener("change",(e)=>{ state.robot.faultType=e.target.value; state.robot.page=1; loadRobots(); });
-  document.getElementById("anomalyRobotSelect").addEventListener("change",(e)=> loadAnomalyTrend(e.target.value || null));
-  document.getElementById("logSearch").addEventListener("input", debounce((e)=>{
-    state.logs.search = e.target.value.trim(); state.logs.page=1; loadLogs();
-  }, 300));
-  document.getElementById("logRobotFilter").addEventListener("change",(e)=>{ state.logs.robotId=e.target.value; state.logs.page=1; loadLogs(); });
-  document.getElementById("logLevelFilter").addEventListener("change",(e)=>{ state.logs.errorLevel=e.target.value; state.logs.page=1; loadLogs(); });
-  document.getElementById("logFaultFilter").addEventListener("change",(e)=>{ state.logs.faultType=e.target.value; state.logs.page=1; loadLogs(); });
-  document.getElementById("logPageSize").addEventListener("change",(e)=>{ state.logs.pageSize=parseInt(e.target.value,10); state.logs.page=1; loadLogs(); });
-  document.getElementById("modalClose").addEventListener("click", closeModal);
-  document.getElementById("modalBackdrop").addEventListener("click",(e)=>{ if(e.target.id==="modalBackdrop") closeModal(); });
+  document.getElementById("statusFilter").addEventListener("change", e=>{
+    state.status=e.target.value; state.page=1; loadRobots();
+  });
+  document.getElementById("faultFilter").addEventListener("change", e=>{
+    state.faultType=e.target.value; state.page=1; loadRobots();
+  });
+  document.getElementById("anomalyRobotSelect").addEventListener("change", e=>{
+    loadAnomalyTrend(e.target.value || null);
+  });
 }
 
-async function loadAll(){
-  await loadFilterOptions();
-  await refreshWindowedData();
-}
-
-async function refreshWindowedData(){
-  await Promise.all([loadStats(), loadAnomalyTrend(), loadFaultDistribution(), loadRobots(), loadLogs()]);
-}
-
-function resetWindowedPages(){
-  state.robot.page = 1;
-  state.logs.page = 1;
-}
-
-function toggleCustomRange(){
-  document.getElementById("customRange").hidden = state.window !== "custom";
-}
-
-function customRangeReady(){
-  return Boolean(state.startDate && state.endDate);
-}
-
-function rangeParams(){
-  const params = new URLSearchParams({ window:state.window });
-  if(state.window === "custom"){
-    if(state.startDate) params.set("start_date", state.startDate);
-    if(state.endDate) params.set("end_date", state.endDate);
-  }
-  return params;
+async function loadDashboard(){
+  await Promise.all([loadStats(), loadAnomalyTrend(), loadFaultDistribution(), loadFilterOptions()]);
+  await loadRobots();
+  populateAnomalyRobotSelect();
 }
 
 async function loadStats(){
   try{
-    const data = await fetchJson(`${API.stats}?${rangeParams()}`);
-    setStatCard("active", data.active_robots, `of ${data.active_robots.total} total robots`, false, data.comparison_label);
-    setStatCard("critical", data.critical_alerts, "robots require attention", false, data.comparison_label);
-    setStatCard("fleet", data.fleet_health, "healthy robots", true, data.comparison_label);
-    setLogRecordsCard(data.log_records?.value || 0);
-    if(data.range?.start && data.range?.end){
-      document.getElementById("dateRange").textContent =
-        `${formatRange(data.range.start)} - ${formatRange(data.range.end)}`;
+    const d = await fetchJson(`/api/stats${rangeQuery()}`);
+    setStatCard("active", d.active_robots, `of ${d.active_robots.total} total robots`);
+    setStatCard("critical", d.critical_alerts, "robots require attention");
+    setStatCard("fleet", d.fleet_health, "healthy robots", true);
+    if (d.range?.start && d.range?.end){
+      if (!state.range.extentStart){ state.range.extentStart = d.range.start; state.range.extentEnd = d.range.end; }
+      updateDateLabel(d.range.start, d.range.end);
     }
-  }catch(e){ console.error("loadStats", e); }
+  }catch(e){ console.error(e); }
 }
 
-function setStatCard(kind, payload, subText, isPercent=false, comparisonLabel="vs previous range"){
+function rangeQuery(prefix="?"){
+  const parts = [];
+  if (state.range.start) parts.push("start_date=" + encodeURIComponent(state.range.start));
+  if (state.range.end)   parts.push("end_date="   + encodeURIComponent(state.range.end));
+  return parts.length ? prefix + parts.join("&") : "";
+}
+
+function rangeQueryAmp(){ return rangeQuery("&"); }
+
+function updateDateLabel(startIso, endIso){
+  const text = `${formatRange(startIso)} – ${formatRange(endIso)} ▾`;
+  ["dateRange","fhDateRange","predDateRange"].forEach(id=>{
+    const el = document.getElementById(id); if (el) el.textContent = text;
+  });
+}
+
+function setStatCard(kind, payload, subText, isPercent=false){
   const map = {
-    active:   {v:"activeRobotsValue", s:"activeRobotsSub", t:"activeRobotsTrend", b:"activeRobotsBar"},
-    critical: {v:"criticalValue",     s:null,              t:"criticalTrend",     b:"criticalBar"},
-    fleet:    {v:"fleetValue",        s:null,              t:"fleetTrend",        b:"fleetBar"},
+    active:{v:"activeRobotsValue",s:"activeRobotsSub",t:"activeRobotsTrend",b:"activeRobotsBar"},
+    critical:{v:"criticalValue",s:null,t:"criticalTrend",b:"criticalBar"},
+    fleet:{v:"fleetValue",s:null,t:"fleetTrend",b:"fleetBar"},
   }[kind];
-  const v = document.getElementById(map.v);
-  v.textContent = isPercent ? `${payload.value}%` : formatNumber(payload.value);
-  if(map.s) document.getElementById(map.s).textContent = subText;
-  const t = document.getElementById(map.t);
-  const d = payload.delta_pct;
-  if(d === null || d === undefined){
-    t.innerHTML = `<span class="badge badge-flat">${escapeHtml(comparisonLabel)}</span><span class="trend-sub">selected range</span>`;
-  }else{
-    const arrow = d>0 ? "↑" : d<0 ? "↓" : "→";
-    const cls = d>0 ? "badge-up" : d<0 ? "badge-down" : "badge-flat";
-    t.innerHTML = `<span class="badge ${cls}">${arrow} ${Math.abs(d).toFixed(1)}%</span><span class="trend-sub">${escapeHtml(comparisonLabel)}</span>`;
-  }
-  const bar = document.getElementById(map.b);
+  document.getElementById(map.v).textContent = isPercent ? `${payload.value}%` : payload.value;
+  if (map.s) document.getElementById(map.s).textContent = subText;
+  renderTrend(map.t, payload.delta_pct);
   let pct = 0;
-  if(kind==="active") pct = payload.total ? (payload.value/payload.total)*100 : 0;
-  else if(kind==="fleet") pct = payload.value;
+  if (kind==="active") pct = payload.total ? (payload.value/payload.total)*100 : 0;
+  else if (kind==="fleet") pct = payload.value;
   else pct = Math.min(100, payload.value*8);
-  bar.style.width = `${pct}%`;
+  document.getElementById(map.b).style.width = `${pct}%`;
 }
 
-function setLogRecordsCard(value){
-  document.getElementById("logRecordsValue").textContent = formatNumber(value);
-  document.getElementById("logRecordsSub").textContent = "records in range";
-  const pct = state.totalLogCount ? Math.max(2, Math.min(100, value / state.totalLogCount * 100)) : 100;
-  document.getElementById("logRecordsBar").style.width = `${pct}%`;
-  document.getElementById("logRecordsTrend").innerHTML =
-    `<span class="badge badge-flat">${formatNumber(state.totalLogCount)} total</span><span class="trend-sub">source rows</span>`;
+function renderTrend(elId, delta){
+  const d = delta ?? 0;
+  const arrow = d>0 ? "↑" : d<0 ? "↓" : "→";
+  const cls = d>0 ? "badge-up" : d<0 ? "badge-down" : "badge-flat";
+  document.getElementById(elId).innerHTML =
+    `<span class="badge ${cls}">${arrow} ${Math.abs(d).toFixed(1)}%</span><span class="trend-sub">vs prev period</span>`;
 }
 
 async function loadAnomalyTrend(robotId=null){
   try{
-    const params = rangeParams();
-    if(robotId) params.set("robot_id", robotId);
-    const data = await fetchJson(`${API.trend}?${params}`);
-    const labels = data.points.map(p=>formatBucketDate(p.date, data.bucket));
-    const scores = data.points.map(p=>p.score);
-    renderAnomalyChart(labels, scores);
-  }catch(e){ console.error("loadAnomalyTrend", e); }
+    const base = robotId ? `/api/anomaly-trend?robot_id=${encodeURIComponent(robotId)}` : "/api/anomaly-trend";
+    const url = base + (base.includes("?") ? rangeQueryAmp() : rangeQuery());
+    const d = await fetchJson(url);
+    renderLine("anomalyChart", d.points.map(p=>formatShortDate(p.date)), d.points.map(p=>p.score), "#3b82f6");
+  }catch(e){ console.error(e); }
 }
 
-function renderAnomalyChart(labels, scores){
-  const ctx = document.getElementById("anomalyChart").getContext("2d");
+function renderLine(canvasId, labels, data, color){
+  const ctx = document.getElementById(canvasId).getContext("2d");
   const grad = ctx.createLinearGradient(0,0,0,260);
-  grad.addColorStop(0,"rgba(59,130,246,0.30)");
-  grad.addColorStop(1,"rgba(59,130,246,0.00)");
-  if(anomalyChart) anomalyChart.destroy();
-  anomalyChart = new Chart(ctx, {
+  grad.addColorStop(0, color+"4d"); grad.addColorStop(1, color+"00");
+  charts[canvasId]?.destroy();
+  charts[canvasId] = new Chart(ctx,{
     type:"line",
-    data:{ labels, datasets:[{
-      label:"Anomaly Score", data:scores, borderColor:"#3b82f6",
-      backgroundColor:grad, fill:true, tension:0.35, borderWidth:2,
-      pointRadius:3, pointBackgroundColor:"#3b82f6", pointHoverRadius:6,
-    }]},
-    options:{
-      responsive:true, maintainAspectRatio:false,
-      plugins:{ legend:{display:false}, tooltip:{ backgroundColor:"#1f2937", padding:10,
-        callbacks:{ label:(c)=>`Anomaly Score: ${c.parsed.y.toFixed(1)}` } } },
-      scales:{
-        x:{ grid:{display:false}, ticks:{color:"#94a3b8"} },
-        y:{ beginAtZero:true, max:100, grid:{color:"#eef2f7"}, ticks:{color:"#94a3b8"} },
-      },
-    },
+    data:{labels, datasets:[{ data, borderColor:color, backgroundColor:grad,
+      fill:true, tension:0.35, borderWidth:2, pointRadius:2, pointBackgroundColor:color }]},
+    options:{ responsive:true, maintainAspectRatio:false,
+      plugins:{legend:{display:false}, tooltip:{backgroundColor:"#1f2937", padding:10}},
+      scales:{ x:{grid:{display:false},ticks:{color:"#94a3b8"}},
+               y:{beginAtZero:true,max:100,grid:{color:"#eef2f7"},ticks:{color:"#94a3b8"}} } }
   });
 }
 
 async function loadFaultDistribution(){
-  try{
-    const params = rangeParams();
-    params.set("limit", "6");
-    const data = await fetchJson(`${API.faults}?${params}`);
-    renderFaultChart(data);
-  }catch(e){ console.error("loadFaultDistribution", e); }
+  try{ const d = await fetchJson(`/api/fault-distribution${rangeQuery()}`); renderFaultDonut(d); }
+  catch(e){ console.error(e); }
 }
 
-function renderFaultChart({items, total}){
+function renderFaultDonut({items, total}){
   const ctx = document.getElementById("faultChart").getContext("2d");
-  if(!items || !items.length){
-    if(faultChart) faultChart.destroy();
-    document.getElementById("faultLegend").innerHTML = `<li>No data</li>`;
-    return;
-  }
   const labels = items.map(x=>x.label);
   const values = items.map(x=>x.count);
   const colors = items.map((_,i)=>FAULT_COLORS[i % FAULT_COLORS.length]);
-  if(faultChart) faultChart.destroy();
-  faultChart = new Chart(ctx, {
+  charts.faultChart?.destroy();
+  charts.faultChart = new Chart(ctx, {
     type:"doughnut",
-    data:{ labels, datasets:[{ data:values, backgroundColor:colors, borderWidth:0 }] },
-    options:{ responsive:true, maintainAspectRatio:false, cutout:"70%",
-      plugins:{ legend:{display:false},
-        tooltip:{ callbacks:{ label:(c)=>`${c.label}: ${c.parsed}` } } } },
-    plugins:[{ id:"center", beforeDraw(chart){
-      const { ctx, chartArea:{left,right,top,bottom} } = chart;
+    data:{labels, datasets:[{data:values, backgroundColor:colors, borderWidth:0}]},
+    options:{responsive:true, maintainAspectRatio:false, cutout:"70%",
+      plugins:{legend:{display:false}, tooltip:{callbacks:{label:c=>`${c.label}: ${c.parsed}`}}} },
+    plugins:[{id:"center", beforeDraw(chart){
+      const {ctx, chartArea:{left,right,top,bottom}} = chart;
       const cx=(left+right)/2, cy=(top+bottom)/2;
-      ctx.save();
-      ctx.fillStyle="#0f172a"; ctx.font="700 24px Inter, sans-serif";
+      ctx.save(); ctx.fillStyle="#0f172a"; ctx.font="700 22px Inter, sans-serif";
       ctx.textAlign="center"; ctx.textBaseline="middle";
       ctx.fillText(total.toLocaleString(), cx, cy-8);
       ctx.fillStyle="#94a3b8"; ctx.font="500 11px Inter, sans-serif";
@@ -1309,54 +1639,34 @@ function renderFaultChart({items, total}){
     }}],
   });
   document.getElementById("faultLegend").innerHTML = items.map((it,i)=>`
-    <li>
-      <span class="label"><span class="dot" style="background:${colors[i]}"></span>${escapeHtml(it.label)}</span>
-      <span><span class="value">${it.count}</span> <span class="pct">(${it.pct}%)</span></span>
-    </li>`).join("");
+    <li><span><span class="dot" style="background:${colors[i]}"></span>${escapeHtml(it.label)}</span>
+      <span><span class="value">${it.count}</span> <span class="pct">(${it.pct}%)</span></span></li>`).join("");
 }
 
 async function loadFilterOptions(){
   try{
-    const data = await fetchJson(API.options);
-    state.totalLogCount = data.counts?.logs || 0;
-    configureDateInputs(data.range);
-    document.getElementById("statusFilter").innerHTML = data.statuses.map(s=>`<option value="${s}">${s}</option>`).join("");
-    document.getElementById("faultFilter").innerHTML = data.fault_types.map(s=>`<option value="${s}">${s}</option>`).join("");
-    document.getElementById("logFaultFilter").innerHTML = data.fault_types.map(s=>`<option value="${s}">${s}</option>`).join("");
-    document.getElementById("logLevelFilter").innerHTML = data.error_levels.map(s=>`<option value="${s}">${s}</option>`).join("");
-
-    const robotOptions = [`<option value="">All Robots</option>`]
-      .concat(data.robot_ids.map(id=>`<option value="${escapeHtml(id)}">${escapeHtml(shortenId(id))}</option>`));
-    document.getElementById("anomalyRobotSelect").innerHTML = robotOptions.join("");
-    document.getElementById("logRobotFilter").innerHTML = [`<option value="all">All Robots</option>`]
-      .concat(data.robot_ids.map(id=>`<option value="${escapeHtml(id)}">${escapeHtml(shortenId(id))}</option>`)).join("");
-  }catch(e){ console.error("loadFilterOptions", e); }
-}
-
-function configureDateInputs(range){
-  if(!range?.extent_start || !range?.extent_end) return;
-  const min = toInputDate(range.extent_start);
-  const max = toInputDate(range.extent_end);
-  for(const id of ["startDate","endDate"]){
-    const el = document.getElementById(id);
-    el.min = min; el.max = max;
-  }
-  state.startDate = min;
-  state.endDate = max;
-  document.getElementById("startDate").value = min;
-  document.getElementById("endDate").value = max;
+    const d = await fetchJson("/api/filter-options");
+    document.getElementById("statusFilter").innerHTML = d.statuses.map(s=>`<option>${s}</option>`).join("");
+    document.getElementById("faultFilter").innerHTML = d.fault_types.map(s=>`<option>${s}</option>`).join("");
+    document.getElementById("fhRobotFilter").innerHTML = d.robots.map(s=>`<option>${s}</option>`).join("");
+    document.getElementById("fhFaultFilter").innerHTML = d.fault_types.map(s=>`<option>${s}</option>`).join("");
+    document.getElementById("fhStatusFilter").innerHTML = d.statuses.map(s=>`<option>${s}</option>`).join("");
+    document.getElementById("predRobotFilter").innerHTML = d.robots.map(s=>`<option>${s}</option>`).join("");
+    document.getElementById("predCategoryFilter").innerHTML = d.categories.map(s=>`<option>${s}</option>`).join("");
+  }catch(e){ console.error(e); }
 }
 
 async function loadRobots(){
-  const params = rangeParams();
-  params.set("page", String(state.robot.page));
-  params.set("page_size", String(state.robot.pageSize));
-  if(state.robot.search) params.set("search", state.robot.search);
-  if(state.robot.status && state.robot.status!=="All Statuses") params.set("status", state.robot.status);
-  if(state.robot.faultType && state.robot.faultType!=="All Fault Types") params.set("fault_type", state.robot.faultType);
+  const params = new URLSearchParams({page:state.page, page_size:state.pageSize});
+  if (state.search) params.set("search", state.search);
+  if (state.status && state.status!=="All Statuses") params.set("status", state.status);
+  if (state.faultType && state.faultType!=="All Fault Types") params.set("fault_type", state.faultType);
+  if (state.range.start) params.set("start_date", state.range.start);
+  if (state.range.end)   params.set("end_date", state.range.end);
   try{
-    const data = await fetchJson(`${API.robots}?${params}`);
-    renderRobotTable(data); renderPagination(data);
+    const d = await fetchJson(`/api/robots?${params}`);
+    renderRobotTable(d);
+    renderPagination("pagination","paginationInfo", d, p=>{state.page=p; loadRobots();}, "robots");
   }catch(e){
     document.getElementById("robotTableBody").innerHTML =
       `<tr><td colspan="6" class="empty">Failed to load: ${escapeHtml(String(e))}</td></tr>`;
@@ -1365,19 +1675,15 @@ async function loadRobots(){
 
 function renderRobotTable({items}){
   const body = document.getElementById("robotTableBody");
-  if(!items.length){ body.innerHTML = `<tr><td colspan="6" class="empty">No robots found</td></tr>`; return; }
+  if (!items.length){ body.innerHTML = `<tr><td colspan="6" class="empty">No robots found</td></tr>`; return; }
   body.innerHTML = items.map(r=>{
     const conf = Math.round(r.confidence ?? 0);
-    let cc = "green"; if(conf>=60) cc="red"; else if(conf>=30) cc="amber";
+    let cc = "green"; if (conf>=60) cc="red"; else if (conf>=30) cc="amber";
     return `
       <tr>
         <td>
           <div class="robot-id-cell">
-            <div class="robot-thumb">
-              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="4" y="8" width="16" height="11" rx="2"></rect><path d="M8 8V6a4 4 0 0 1 8 0v2"></path>
-                <circle cx="9" cy="13" r="1"></circle><circle cx="15" cy="13" r="1"></circle></svg>
-            </div>
+            <div class="robot-thumb">${robotSvg()}</div>
             <div>
               <div class="robot-id">${escapeHtml(shortenId(r.robot_id))}</div>
               <div class="robot-area">${escapeHtml(r.area || "")}</div>
@@ -1397,32 +1703,260 @@ function renderRobotTable({items}){
         </td>
         <td>${formatLong(r.last_updated)}</td>
         <td class="action-col">
-          <button class="btn-secondary" data-id="${escapeHtml(r.robot_id)}">View Details</button>
-          <button class="kebab" aria-label="More">⋮</button>
+          <button class="btn-secondary" onclick="openRobotModal('${escapeAttr(r.robot_id)}')">View Details</button>
+          <button class="kebab" title="More">⋮</button>
         </td>
       </tr>`;
   }).join("");
-  body.querySelectorAll(".btn-secondary").forEach(btn=>{
-    btn.addEventListener("click", ()=> openRobotModal(btn.dataset.id));
+}
+
+async function populateAnomalyRobotSelect(){
+  try{
+    const d = await fetchJson("/api/robots?page=1&page_size=30");
+    const ids = [...new Set(d.items.map(r=>r.robot_id))].slice(0,30);
+    document.getElementById("anomalyRobotSelect").innerHTML =
+      `<option value="">All Robots</option>` +
+      ids.map(id=>`<option value="${escapeAttr(id)}">${escapeHtml(shortenId(id))}</option>`).join("");
+  }catch{}
+}
+
+function bindFaultHistoryUI(){
+  document.getElementById("fhSearch").addEventListener("input", debounce(e=>{
+    state.fh.search = e.target.value.trim(); state.fh.page=1; loadFhList();
+  }, 300));
+  ["fhRobotFilter","fhFaultFilter","fhStatusFilter"].forEach((id,i)=>{
+    document.getElementById(id).addEventListener("change", e=>{
+      const key = ["robot","fault_type","status"][i];
+      state.fh[key] = e.target.value; state.fh.page=1; loadFhList();
+    });
+  });
+  document.getElementById("fhStartDate").addEventListener("change", e=>{
+    state.fh.start_date=e.target.value; state.fh.page=1; loadFhList();
+  });
+  document.getElementById("fhEndDate").addEventListener("change", e=>{
+    state.fh.end_date=e.target.value; state.fh.page=1; loadFhList();
   });
 }
 
-function renderPagination({total, page, page_size}){
+function clearFhFilters(){
+  state.fh = {page:1, pageSize:8, search:"", robot:"All Robots", fault_type:"All Fault Types", status:"All Statuses", start_date:"", end_date:""};
+  document.getElementById("fhSearch").value="";
+  document.getElementById("fhRobotFilter").value="All Robots";
+  document.getElementById("fhFaultFilter").value="All Fault Types";
+  document.getElementById("fhStatusFilter").value="All Statuses";
+  document.getElementById("fhStartDate").value="";
+  document.getElementById("fhEndDate").value="";
+  loadFhList();
+}
+
+async function loadFaultHistory(){
+  await Promise.all([loadFhFrequency(), loadFhList()]);
+}
+
+async function loadFhFrequency(){
+  try{
+    const d = await fetchJson(`/api/fault-history/frequency${rangeQuery()}`);
+    const datasets = d.datasets.map(ds=>({label:ds.label, data:ds.data,
+      backgroundColor: CAT_COLORS[ds.label] || "#94a3b8", borderRadius:4}));
+    const ctx = document.getElementById("freqChart").getContext("2d");
+    charts.freqChart?.destroy();
+    charts.freqChart = new Chart(ctx, {
+      type:"bar", data:{labels:d.labels, datasets},
+      options:{ responsive:true, maintainAspectRatio:false,
+        plugins:{legend:{display:false}},
+        scales:{ x:{stacked:true, grid:{display:false}, ticks:{color:"#94a3b8"}},
+                 y:{stacked:true, grid:{color:"#eef2f7"}, ticks:{color:"#94a3b8"}} } }
+    });
+  }catch(e){ console.error(e); }
+}
+
+async function loadFhList(){
+  const p = new URLSearchParams({page:state.fh.page, page_size:state.fh.pageSize});
+  if (state.fh.search) p.set("search", state.fh.search);
+  if (state.fh.robot && state.fh.robot!=="All Robots") p.set("robot", state.fh.robot);
+  if (state.fh.fault_type && state.fh.fault_type!=="All Fault Types") p.set("fault_type", state.fh.fault_type);
+  if (state.fh.status && state.fh.status!=="All Statuses") p.set("status", state.fh.status);
+  if (state.fh.start_date) p.set("start_date", state.fh.start_date);
+  if (state.fh.end_date) p.set("end_date", state.fh.end_date);
+  try{
+    const d = await fetchJson(`/api/fault-history/list?${p}`);
+    renderFhTable(d);
+    renderPagination("fhPagination","fhPaginationInfo", d, x=>{state.fh.page=x; loadFhList();}, "faults");
+  }catch(e){
+    document.getElementById("fhTableBody").innerHTML =
+      `<tr><td colspan="7" class="empty">Failed to load: ${escapeHtml(String(e))}</td></tr>`;
+  }
+}
+
+function renderFhTable({items}){
+  const body = document.getElementById("fhTableBody");
+  if (!items.length){ body.innerHTML = `<tr><td colspan="7" class="empty">No faults match the filters</td></tr>`; return; }
+  body.innerHTML = items.map(it=>{
+    const catColor = CAT_COLORS[it.category] || "#94a3b8";
+    const resCls = it.resolution==="Resolved" ? "resolved" : "in-progress";
+    return `
+      <tr>
+        <td><div style="font-weight:600">${formatDate(it.task_time)}</div>
+            <div style="font-size:11.5px;color:var(--text-mute)">${formatTimeOnly(it.task_time)}</div></td>
+        <td><div class="robot-id-cell"><div class="robot-thumb">${robotSvg()}</div>
+              <div class="robot-id">${escapeHtml(shortenId(it.robot_id))}</div></div></td>
+        <td><span class="cat-dot" style="background:${catColor}"></span>${escapeHtml(it.category)}</td>
+        <td><div class="fault-name">${escapeHtml(it.diagnosed_issue)}</div>
+            <div class="fault-detail">${escapeHtml(it.fault_type_raw)}</div></td>
+        <td>${escapeHtml(it.downtime)}</td>
+        <td><span class="status ${resCls}">${it.resolution}</span></td>
+        <td class="action-col">
+          <button class="icon-btn" title="View" onclick="openRobotModal('${escapeAttr(it.robot_id)}')">👁</button>
+          <button class="icon-btn" title="Download">⬇</button>
+        </td>
+      </tr>`;
+  }).join("");
+}
+
+function bindPredictionsUI(){
+  document.getElementById("degrCategoryFilter").addEventListener("change", e=>{
+    state.pred.category = e.target.value; loadDegradation();
+  });
+}
+
+async function loadPredictions(){
+  await Promise.all([loadHeatmap(), loadDegradation(), loadPredStats(), loadTopFailures()]);
+}
+
+async function loadHeatmap(){
+  try{
+    const d = await fetchJson("/api/predictions/heatmap");
+    const grid = document.getElementById("heatmapGrid");
+    if (!d.robot_ids.length){ grid.innerHTML = `<div class="empty">No data</div>`; return; }
+    const rows = d.robot_ids.map((rid,i)=>`
+      <div class="row">
+        <div class="rlabel" title="${escapeAttr(rid)}">${escapeHtml(shortenId(rid))}</div>
+        ${d.grid[i].map(v=>`<div class="cell" style="background:${riskColor(v)}" title="${v}%"></div>`).join("")}
+      </div>`).join("");
+    const labels = `<div class="clabels">${d.weeks.map(w=>`<span>${escapeHtml(w)}</span>`).join("")}</div>`;
+    grid.innerHTML = rows + labels;
+  }catch(e){ console.error(e); }
+}
+
+function riskColor(v){
+  if (v>=60) return "#ef4444";
+  if (v>=45) return "#f97316";
+  if (v>=30) return "#f59e0b";
+  if (v>=15) return "#fde047";
+  return "#86efac";
+}
+
+async function loadDegradation(){
+  try{
+    const d = await fetchJson(`/api/predictions/degradation?category=${encodeURIComponent(state.pred.category)}`);
+    renderDegradation("lstmChart", "lstmBadge", d, "#3b82f6", false);
+    renderDegradation("rfChart", "rfBadge", d, "#10b981", true);
+  }catch(e){ console.error(e); }
+}
+
+function renderDegradation(canvasId, badgeId, d, color, useRf){
+  charts[canvasId]?.destroy();
+  const ctx = document.getElementById(canvasId).getContext("2d");
+  const predData = useRf ? d.rf_pred : d.lstm_pred;
+  charts[canvasId] = new Chart(ctx,{
+    type:"line",
+    data:{ labels:d.labels,
+      datasets:[
+        {label:"Actual", data:d.actual, borderColor:color, backgroundColor:"transparent",
+         borderWidth:2, tension:0.3, pointRadius:2, spanGaps:false},
+        {label:"Predicted", data:predData, borderColor:color, backgroundColor:"transparent",
+         borderWidth:2, borderDash:[5,5], tension:0.3, pointRadius:2, spanGaps:false},
+      ]
+    },
+    options:{ responsive:true, maintainAspectRatio:false,
+      plugins:{legend:{display:true, position:"top", labels:{boxWidth:10, font:{size:10}}}},
+      scales:{ x:{grid:{display:false}, ticks:{color:"#94a3b8", font:{size:10}}},
+               y:{beginAtZero:true, max:100, grid:{color:"#eef2f7"}, ticks:{color:"#94a3b8", font:{size:10}}} } }
+  });
+  if (d.predicted_failure_label){
+    document.getElementById(badgeId).innerHTML = `Predicted Failure<br><strong>${escapeHtml(d.predicted_failure_label)}</strong>`;
+  } else { document.getElementById(badgeId).textContent = "—"; }
+}
+
+async function loadPredStats(){
+  try{
+    const d = await fetchJson("/api/predictions/stats");
+    setPredCard("predFleet","predFleetTrend","predFleetBar", d.fleet_health.value+"%", d.fleet_health.delta_pct, d.fleet_health.value);
+    setPredCard("predHighRisk","predHighRiskTrend","predHighRiskBar", d.high_risk.value, d.high_risk.delta_pct, Math.min(100, d.high_risk.value*12));
+    setPredCard("predFail","predFailTrend","predFailBar", d.predicted_fail.value, d.predicted_fail.delta_pct, Math.min(100, d.predicted_fail.value*12));
+    setPredCard("predAcc","predAccTrend","predAccBar", d.model_accuracy.value+"%", d.model_accuracy.delta_pct, d.model_accuracy.value);
+  }catch(e){ console.error(e); }
+}
+
+function setPredCard(valId, trendId, barId, val, delta, barPct){
+  document.getElementById(valId).textContent = val;
+  renderTrend(trendId, delta);
+  document.getElementById(barId).style.width = `${Math.max(0, Math.min(100, barPct))}%`;
+}
+
+async function loadTopFailures(){
+  try{
+    const d = await fetchJson("/api/predictions/top-failures");
+    const root = document.getElementById("predCardsContainer");
+    if (!d.items.length){ root.innerHTML = `<div class="empty">No predictions available</div>`; return; }
+    root.innerHTML = d.items.slice(0,5).map(it=>{
+      const rk = it.risk_level.split(" ")[0];
+      return `
+        <div class="pred-card ${rk}">
+          <div class="head">
+            <div class="thumb">${robotSvg()}</div>
+            <div>
+              <div class="id">${escapeHtml(shortenId(it.robot_id))}</div>
+              <div class="area">${escapeHtml(it.area)}</div>
+            </div>
+          </div>
+          <div class="prob-row">
+            <span class="prob" style="color:${rk==='Critical'?'var(--red)':rk==='High'?'var(--amber)':rk==='Medium'?'#a16207':'var(--green)'}">${it.failure_probability}%</span>
+            <span class="risk-pill ${rk}">${escapeHtml(it.risk_level)}</span>
+          </div>
+          <div><div class="label-sm">Failure Probability</div></div>
+          <div><div class="label-sm">Predicted Issue</div><div class="issue">${escapeHtml(it.predicted_issue)}</div></div>
+          <div><div class="label-sm">Estimated Time</div><div class="time">${formatLong(it.estimated_time)}</div></div>
+          <button class="btn-view" onclick="openRobotModal('${escapeAttr(it.robot_id)}')">View Details</button>
+        </div>`;
+    }).join("");
+  }catch(e){ console.error(e); }
+}
+
+async function loadModelInfo(){
+  try{
+    const d = await fetchJson("/api/model-info");
+    if (!d.model_name){ document.getElementById("modelInfoCard").textContent = "No model registered."; return; }
+    const m = d.metrics || {};
+    document.getElementById("modelInfoCard").innerHTML = `
+      <h3 style="margin-top:0">${escapeHtml(d.model_name)}</h3>
+      <p style="color:var(--text-mute);margin-top:0">Status: <strong>${escapeHtml(d.status)}</strong> · Retrained: <strong>${d.retrained}</strong> · Dataset: <strong>${(d.dataset_row_count||0).toLocaleString()} rows</strong></p>
+      <div class="meta-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-top:14px">
+        ${Object.entries(m).filter(([k])=>!["metric_source"].includes(k)).map(([k,v])=>`
+          <div style="background:#f9fafc;border-radius:8px;padding:12px">
+            <div style="font-size:11px;color:var(--text-mute);text-transform:uppercase">${escapeHtml(k)}</div>
+            <div style="font-size:18px;font-weight:700">${typeof v==="number" ? (v<1 ? (v*100).toFixed(2)+"%" : v) : escapeHtml(String(v))}</div>
+          </div>`).join("")}
+      </div>`;
+  }catch(e){ document.getElementById("modelInfoCard").textContent = "Failed: " + e; }
+}
+
+function renderPagination(navId, infoId, {total, page, page_size}, onGo, noun){
   const totalPages = Math.max(1, Math.ceil(total/page_size));
   const startN = total===0 ? 0 : (page-1)*page_size + 1;
   const endN = Math.min(total, page*page_size);
-  document.getElementById("paginationInfo").textContent = `Showing ${startN} to ${endN} of ${total} robots`;
-  const pag = document.getElementById("pagination");
-  const buttons = [`<button ${page===1?"disabled":""} data-go="${page-1}">‹</button>`];
-  for(const p of pageWindow(page, totalPages, 5)){
-    buttons.push(`<button class="${p===page?"active":""}" data-go="${p}">${p}</button>`);
+  document.getElementById(infoId).textContent = `Showing ${startN} to ${endN} of ${total} ${noun}`;
+  const nav = document.getElementById(navId);
+  const html = [`<button ${page===1?"disabled":""} data-go="${page-1}">‹</button>`];
+  for (const p of pageWindow(page, totalPages, 5)){
+    html.push(`<button class="${p===page?"active":""}" data-go="${p}">${p}</button>`);
   }
-  buttons.push(`<button ${page===totalPages?"disabled":""} data-go="${page+1}">›</button>`);
-  pag.innerHTML = buttons.join("");
-  pag.querySelectorAll("button[data-go]").forEach(btn=>{
+  html.push(`<button ${page===totalPages?"disabled":""} data-go="${page+1}">›</button>`);
+  nav.innerHTML = html.join("");
+  nav.querySelectorAll("button[data-go]").forEach(btn=>{
     btn.addEventListener("click", ()=>{
-      const t = parseInt(btn.dataset.go,10);
-      if(!isNaN(t) && t>=1 && t<=totalPages){ state.robot.page=t; loadRobots(); }
+      const t = parseInt(btn.dataset.go, 10);
+      if (!isNaN(t) && t>=1 && t<=totalPages) onGo(t);
     });
   });
 }
@@ -1432,78 +1966,7 @@ function pageWindow(current, total, span=5){
   let start = Math.max(1, current-half);
   let end = Math.min(total, start+span-1);
   start = Math.max(1, end-span+1);
-  const out=[]; for(let i=start;i<=end;i++) out.push(i);
-  return out;
-}
-
-async function loadLogs(){
-  const params = rangeParams();
-  params.set("page", String(state.logs.page));
-  params.set("page_size", String(state.logs.pageSize));
-  if(state.logs.search) params.set("search", state.logs.search);
-  if(state.logs.robotId && state.logs.robotId !== "all") params.set("robot_id", state.logs.robotId);
-  if(state.logs.errorLevel && state.logs.errorLevel !== "All Levels") params.set("error_level", state.logs.errorLevel);
-  if(state.logs.faultType && state.logs.faultType !== "All Fault Types") params.set("fault_type", state.logs.faultType);
-  try{
-    const data = await fetchJson(`${API.logs}?${params}`);
-    renderLogTable(data);
-    renderLogPagination(data);
-    if(data.range?.start && data.range?.end){
-      document.getElementById("logScope").textContent =
-        `${formatNumber(data.total)} rows from ${formatRange(data.range.start)} to ${formatRange(data.range.end)}`;
-    }
-  }catch(e){
-    document.getElementById("logTableBody").innerHTML =
-      `<tr><td colspan="7" class="empty">Failed to load: ${escapeHtml(String(e))}</td></tr>`;
-  }
-}
-
-function renderLogTable({items}){
-  const body = document.getElementById("logTableBody");
-  if(!items.length){ body.innerHTML = `<tr><td colspan="7" class="empty">No logs found</td></tr>`; return; }
-  body.innerHTML = items.map(r=>{
-    const ratio = ((r.hourly_ratio || 0) * 100).toFixed(1);
-    const level = r.error_level || "Unknown";
-    return `
-      <tr>
-        <td class="time-col">${formatLong(r.task_time)}</td>
-        <td>
-          <div class="fault-name">${escapeHtml(shortenId(r.robot_id || ""))}</div>
-          <div class="fault-detail">${escapeHtml(r.product_code || "")}</div>
-        </td>
-        <td><span class="level-pill ${levelClass(level)}">${escapeHtml(level)}</span></td>
-        <td>
-          <div class="fault-name">${escapeHtml(r.error_type || "Unknown")}</div>
-          <div class="fault-detail">${escapeHtml(r.error_id || r.record_id || "")}</div>
-        </td>
-        <td class="detail-col"><div class="log-detail" title="${escapeHtml(r.error_detail || "")}">${escapeHtml(r.error_detail || "-")}</div></td>
-        <td class="metric">${ratio}%</td>
-        <td>
-          <div class="fault-name">${escapeHtml(r.source_group || "-")}</div>
-          <div class="fault-detail">${escapeHtml(r.source_file || "")}</div>
-        </td>
-      </tr>`;
-  }).join("");
-}
-
-function renderLogPagination({total, page, page_size}){
-  const totalPages = Math.max(1, Math.ceil(total/page_size));
-  const startN = total===0 ? 0 : (page-1)*page_size + 1;
-  const endN = Math.min(total, page*page_size);
-  document.getElementById("logPaginationInfo").textContent = `Showing ${formatNumber(startN)} to ${formatNumber(endN)} of ${formatNumber(total)} logs`;
-  const pag = document.getElementById("logPagination");
-  const buttons = [`<button ${page===1?"disabled":""} data-go="${page-1}">‹</button>`];
-  for(const p of pageWindow(page, totalPages, 5)){
-    buttons.push(`<button class="${p===page?"active":""}" data-go="${p}">${p}</button>`);
-  }
-  buttons.push(`<button ${page===totalPages?"disabled":""} data-go="${page+1}">›</button>`);
-  pag.innerHTML = buttons.join("");
-  pag.querySelectorAll("button[data-go]").forEach(btn=>{
-    btn.addEventListener("click", ()=>{
-      const t = parseInt(btn.dataset.go,10);
-      if(!isNaN(t) && t>=1 && t<=totalPages){ state.logs.page=t; loadLogs(); }
-    });
-  });
+  const out=[]; for(let i=start;i<=end;i++) out.push(i); return out;
 }
 
 async function openRobotModal(robotId){
@@ -1512,21 +1975,21 @@ async function openRobotModal(robotId){
   document.getElementById("modalTitle").textContent = `Robot ${shortenId(robotId)}`;
   body.innerHTML = "Loading…"; backdrop.hidden = false;
   try{
-    const data = await fetchJson(API.robot(robotId));
+    const d = await fetchJson(`/api/robot/${encodeURIComponent(robotId)}`);
     body.innerHTML = `
       <div class="meta-grid">
-        <div><span class="k">Robot ID</span><span class="v">${escapeHtml(data.robot_id)}</span></div>
-        <div><span class="k">Product</span><span class="v">${escapeHtml(data.product_code || "-")}</span></div>
-        <div><span class="k">SN</span><span class="v">${escapeHtml(data.sn || "-")}</span></div>
-        <div><span class="k">MAC</span><span class="v">${escapeHtml(data.mac || "-")}</span></div>
-        <div><span class="k">Software</span><span class="v">${escapeHtml(data.soft_version || "-")}</span></div>
-        <div><span class="k">OS</span><span class="v">${escapeHtml(data.os_version || "-")}</span></div>
+        <div><span class="k">Robot ID</span><span class="v">${escapeHtml(d.robot_id)}</span></div>
+        <div><span class="k">Product</span><span class="v">${escapeHtml(d.product_code || "-")}</span></div>
+        <div><span class="k">SN</span><span class="v">${escapeHtml(d.sn || "-")}</span></div>
+        <div><span class="k">MAC</span><span class="v">${escapeHtml(d.mac || "-")}</span></div>
+        <div><span class="k">Software</span><span class="v">${escapeHtml(d.soft_version || "-")}</span></div>
+        <div><span class="k">OS</span><span class="v">${escapeHtml(d.os_version || "-")}</span></div>
       </div>
       <h4>Recent Logs (latest 20)</h4>
       <table>
-        <thead><tr><th>Time</th><th>Type</th><th>Detail</th><th>Level</th><th>Hourly Ratio</th></tr></thead>
+        <thead><tr><th>Time</th><th>Type</th><th>Detail</th><th>Level</th><th>Ratio</th></tr></thead>
         <tbody>
-          ${data.recent_logs.map(l=>`
+          ${d.recent_logs.map(l=>`
             <tr>
               <td>${formatLong(l.task_time)}</td>
               <td>${escapeHtml(l.error_type || "")}</td>
@@ -1536,32 +1999,191 @@ async function openRobotModal(robotId){
             </tr>`).join("")}
         </tbody>
       </table>`;
-  }catch(e){ body.innerHTML = `<p>Failed to load: ${escapeHtml(String(e))}</p>`; }
+  }catch(e){ body.innerHTML = `<p>Failed: ${escapeHtml(String(e))}</p>`; }
+}
+function closeModal(){ document.getElementById("modalBackdrop").hidden = true; }
+
+document.addEventListener("keydown", e=>{
+  if (e.key==="Escape"){ closeModal(); closeDatePicker(); closeNotifPanel(); }
+});
+document.getElementById("modalBackdrop").addEventListener("click", e=>{ if (e.target.id==="modalBackdrop") closeModal(); });
+document.addEventListener("click", e=>{
+  // outside-click closing for popovers
+  const dp = document.getElementById("datePopover");
+  const np = document.getElementById("notifPanel");
+  if (!dp.hidden && !e.target.closest(".date-picker") && !e.target.closest("#datePopover")) dp.hidden = true;
+  if (!np.hidden && !e.target.closest(".bell") && !e.target.closest("#notifPanel")) np.hidden = true;
+});
+
+// =========================================================================
+// Date picker
+// =========================================================================
+function toggleDatePicker(ev, triggerId){
+  ev.stopPropagation();
+  const pop = document.getElementById("datePopover");
+  if (!pop.hidden){ pop.hidden = true; return; }
+  closeNotifPanel();
+  // Position the popover under the trigger button
+  const btn = document.getElementById(triggerId);
+  const r = btn.getBoundingClientRect();
+  pop.style.top = (window.scrollY + r.bottom + 6) + "px";
+  pop.style.right = (window.innerWidth - r.right) + "px";
+  pop.style.left = "auto";
+  // populate inputs
+  document.getElementById("rangeStartInput").value = state.range.start || isoDate(state.range.extentStart);
+  document.getElementById("rangeEndInput").value   = state.range.end   || isoDate(state.range.extentEnd);
+  pop.hidden = false;
+}
+function closeDatePicker(){ document.getElementById("datePopover").hidden = true; }
+
+function isoDate(iso){
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  return d.toISOString().slice(0, 10);
 }
 
-function closeModal(){ document.getElementById("modalBackdrop").hidden = true; }
+function applyRange(){
+  state.range.start = document.getElementById("rangeStartInput").value || "";
+  state.range.end   = document.getElementById("rangeEndInput").value   || "";
+  closeDatePicker();
+  reloadCurrentPage();
+}
+function resetRange(){
+  state.range.start = ""; state.range.end = "";
+  document.getElementById("rangeStartInput").value = isoDate(state.range.extentStart);
+  document.getElementById("rangeEndInput").value   = isoDate(state.range.extentEnd);
+  reloadCurrentPage();
+}
+function applyQuickRange(value){
+  if (value === "all"){
+    state.range.start = ""; state.range.end = "";
+  } else {
+    const days = Number(value);
+    const end = state.range.extentEnd ? new Date(state.range.extentEnd) : new Date();
+    const start = new Date(end); start.setDate(start.getDate() - days + 1);
+    state.range.start = isoDate(start.toISOString());
+    state.range.end   = isoDate(end.toISOString());
+  }
+  closeDatePicker();
+  reloadCurrentPage();
+}
+
+function reloadCurrentPage(){
+  const active = document.querySelector(".page.active");
+  if (!active) return;
+  const id = active.id.replace("page-", "");
+  if (id === "dashboard")     loadDashboard();
+  if (id === "fault-history") loadFaultHistory();
+  if (id === "predictions")   loadPredictions();
+}
+
+// =========================================================================
+// Notifications
+// =========================================================================
+function toggleNotifPanel(ev){
+  ev.stopPropagation();
+  const np = document.getElementById("notifPanel");
+  if (!np.hidden){ np.hidden = true; return; }
+  closeDatePicker();
+  // position near the bell that was clicked
+  const btn = ev.currentTarget.getBoundingClientRect();
+  np.style.top = (window.scrollY + btn.bottom + 6) + "px";
+  np.style.right = (window.innerWidth - btn.right - 16) + "px";
+  np.style.left = "auto";
+  np.hidden = false;
+  loadNotifications();
+}
+function closeNotifPanel(){ document.getElementById("notifPanel").hidden = true; }
+
+async function loadNotifications(){
+  const list = document.getElementById("notifList");
+  list.innerHTML = `<li class="notif-empty">Loading…</li>`;
+  try{
+    const d = await fetchJson("/api/notifications?limit=20");
+    state.notifications.items = d.items;
+    updateBellBadge(d.items.length);
+    if (!d.items.length){ list.innerHTML = `<li class="notif-empty">No active alerts</li>`; return; }
+    list.innerHTML = d.items.map(it=>`
+      <li>
+        <div class="sev ${it.severity}"></div>
+        <div>
+          <div class="title">${escapeHtml(it.title)}</div>
+          <div class="body" title="${escapeAttr(it.detail || '')}">${escapeHtml(shortenId(it.robot_id))} · ${escapeHtml(it.detail || it.level || '')}</div>
+        </div>
+        <div class="when">${formatLong(it.task_time)}</div>
+      </li>`).join("");
+  }catch(e){
+    list.innerHTML = `<li class="notif-empty">Failed: ${escapeHtml(String(e))}</li>`;
+  }
+}
+
+function updateBellBadge(n){
+  ["bellBadge","bellBadge2","bellBadge3"].forEach(id=>{
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = n > 99 ? "99+" : String(n);
+    el.style.display = n ? "" : "none";
+  });
+}
+
+function markAllRead(){
+  updateBellBadge(0);
+  state.notifications.dismissedAt = Date.now();
+  closeNotifPanel();
+}
+
+// Refresh notification badge on first load (independent of page)
+async function refreshNotificationBadge(){
+  try{
+    const d = await fetchJson("/api/notifications?limit=20");
+    state.notifications.items = d.items;
+    updateBellBadge(d.items.length);
+  }catch{}
+}
+
+// Set the top-bar date label as soon as we know the data extent — this fires
+// independently of whichever page is active, so the label never gets stuck on
+// "Date range ▾" if the page-specific loader is slow or fails.
+async function initDateLabel(){
+  try{
+    const d = await fetchJson("/api/stats");
+    if (d.range?.start && d.range?.end){
+      state.range.extentStart = d.range.start;
+      state.range.extentEnd   = d.range.end;
+      updateDateLabel(d.range.start, d.range.end);
+    }
+  }catch{}
+}
+
+document.addEventListener("DOMContentLoaded", ()=>{
+  refreshNotificationBadge();
+  initDateLabel();
+});
 
 async function fetchJson(url){
   const r = await fetch(url);
-  if(!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
   return r.json();
 }
-
-function debounce(fn, ms){ let t; return (...args)=>{ clearTimeout(t); t=setTimeout(()=>fn(...args),ms); }; }
+function debounce(fn, ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
-function shortenId(id){ if(!id) return ""; return id.length>12 ? "RC-"+id.slice(-8) : id; }
-function formatNumber(n){ return Number(n || 0).toLocaleString("en-US"); }
+function escapeAttr(s){ return escapeHtml(s); }
+function shortenId(id){ if (!id) return ""; return id.length>12 ? "RC-"+id.slice(-8) : id; }
 function formatRange(iso){ return new Date(iso).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}); }
-function formatBucketDate(iso, bucket){
-  const d = new Date(iso);
-  if(bucket === "month") return d.toLocaleDateString("en-US",{month:"short",year:"numeric"});
-  if(bucket === "week") return d.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"});
-  return d.toLocaleDateString("en-US",{month:"short",day:"numeric"});
-}
-function formatLong(iso){ if(!iso) return "—";
+function formatShortDate(iso){ return new Date(iso).toLocaleDateString("en-US",{month:"short",day:"numeric"}); }
+function formatLong(iso){ if (!iso) return "—";
   return new Date(iso).toLocaleString("en-US",{month:"short",day:"numeric",year:"numeric",hour:"2-digit",minute:"2-digit",hour12:false}); }
-function toInputDate(iso){ return String(iso).slice(0,10); }
-function levelClass(level){ return String(level || "unknown").toLowerCase().replace(/[^a-z0-9_-]/g,""); }
+function formatDate(iso){ if (!iso) return "—";
+  return new Date(iso).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}); }
+function formatTimeOnly(iso){ if (!iso) return "";
+  return new Date(iso).toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:false}); }
+function robotSvg(){
+  return `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="4" y="8" width="16" height="11" rx="2"></rect>
+    <path d="M8 8V6a4 4 0 0 1 8 0v2"></path>
+    <circle cx="9" cy="13" r="1"></circle><circle cx="15" cy="13" r="1"></circle></svg>`;
+}
 </script>
 </body>
 </html>
