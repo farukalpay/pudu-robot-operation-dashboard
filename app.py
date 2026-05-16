@@ -32,6 +32,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from huggingface_hub import hf_hub_download
 
+from pudu_model_runtime import MODEL_RUNTIME, RuntimeSnapshot
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -137,6 +139,16 @@ async def lifespan(_app: FastAPI):
         init_pool()
     except Exception as e:
         log.warning("Dataset not ready at startup (%s); will retry on first request.", e)
+    try:
+        snapshot = MODEL_RUNTIME.ensure_loaded()
+        log.info(
+            "Model runtime %s from %s (%s)",
+            snapshot.status,
+            snapshot.repo_url,
+            snapshot.git_commit or snapshot.error or "no commit",
+        )
+    except Exception as e:
+        log.warning("Model runtime not ready at startup (%s); API will expose the error.", e)
     yield
 
 
@@ -208,31 +220,58 @@ def _trend_bucket(start: datetime, end: datetime) -> str:
     return "month"
 
 
-def _classify_status(error_level: str | None, hourly_ratio: float | None) -> str:
-    if (error_level or "").lower() in ("critical", "error", "fatal"):
+def _classify_status(error_level: str | None, hourly_ratio: float | None = None) -> str:
+    """Map external model severity contract to the dashboard's compact status labels."""
+    score = MODEL_RUNTIME.severity_score(error_level)
+    if MODEL_RUNTIME.is_failure_level(error_level) or (score is not None and score >= 2):
         return "Critical"
-    r = hourly_ratio or 0.0
-    if r >= 0.6:
-        return "Critical"
-    if r >= 0.3:
+    if score == 1:
         return "Warning"
+    if score is None and error_level:
+        return "Unknown"
     return "Normal"
 
 
 def _category_for_error_type(error_type: str | None) -> str:
-    et = (error_type or "").lower()
-    if any(k in et for k in ("brush", "vacuum", "dust", "drainsewage", "sewage", "mop", "filter", "flow")):
-        return "Vacuum System"
-    if any(k in et for k in ("wheel", "motor", "drive", "encoder", "imu")):
-        return "Brush Motor Issues"
-    if any(k in et for k in ("battery", "power", "charging", "pile")):
-        return "Battery & Power"
-    if any(k in et for k in ("nav", "stuck", "localization", "plan", "pose", "map", "cost", "reach", "schedule")):
-        return "Navigation System"
-    return "Other"
+    return MODEL_RUNTIME.category_for_error_type(error_type)
 
 
-CATEGORY_ORDER = ["Brush Motor Issues", "Battery & Power", "Navigation System", "Vacuum System", "Other"]
+def _failure_levels() -> list[str]:
+    return MODEL_RUNTIME.snapshot().failure_levels
+
+
+def _failure_condition_sql(column: str = "error_level") -> tuple[str, list[str]]:
+    levels = _failure_levels()
+    if not levels:
+        return "FALSE", []
+    placeholders = ",".join(["%s"] * len(levels))
+    return f"COALESCE({column}, '') IN ({placeholders})", levels
+
+
+def _category_order_from_types(error_types: list[str | None]) -> list[str]:
+    categories = {_category_for_error_type(error_type) for error_type in error_types}
+    return sorted(categories)
+
+
+def _metric_dict(snapshot: RuntimeSnapshot, head_id: str) -> dict[str, Any] | None:
+    for metric in snapshot.metrics:
+        if metric.id == head_id:
+            return metric.__dict__
+    return None
+
+
+def _pct(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(float(value) * 100, 1)
+
+
+def _format_hours(hours: float | None) -> str:
+    if hours is None:
+        return "No failure observed"
+    if hours < 24:
+        return f"{hours:.1f} saat"
+    return f"{hours / 24:.1f} gün"
 
 
 # ============================================================================
@@ -244,7 +283,14 @@ def api_health() -> dict[str, Any]:
         with get_cursor() as cur:
             cur.execute("SELECT 1 AS ok;")
             cur.fetchone()
-        return {"ok": True, "source": "huggingface", "dataset": HF_DATASET_REPO, "revision": HF_DATASET_REVISION}
+        runtime = MODEL_RUNTIME.snapshot()
+        return {
+            "ok": True,
+            "source": "huggingface",
+            "dataset": HF_DATASET_REPO,
+            "revision": HF_DATASET_REVISION,
+            "model_runtime": runtime.as_dict(),
+        }
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -256,16 +302,18 @@ def api_filter_options() -> dict[str, Any]:
         ftypes = [r["error_type"] for r in cur.fetchall()]
         cur.execute("SELECT DISTINCT robot_id FROM public.robot_logs_error WHERE robot_id IS NOT NULL ORDER BY robot_id;")
         robots = [r["robot_id"] for r in cur.fetchall()]
+        categories = ["All Components"] + _category_order_from_types(ftypes)
         return {
-            "statuses": ["All Statuses", "Critical", "Warning", "Normal"],
+            "statuses": ["All Statuses", "Critical", "Warning", "Normal", "Unknown"],
             "fault_types": ["All Fault Types"] + ftypes,
             "robots": ["All Robots"] + robots,
-            "categories": ["All Components"] + CATEGORY_ORDER,
+            "categories": categories,
         }
 
 
 @app.get("/api/model-info")
 def api_model_info() -> dict[str, Any]:
+    runtime = MODEL_RUNTIME.snapshot()
     with get_cursor() as cur:
         cur.execute("""
             SELECT model_name, status, retrained, dataset_row_count, metrics, created_at
@@ -273,8 +321,10 @@ def api_model_info() -> dict[str, Any]:
         """)
         r = cur.fetchone()
         if not r:
-            return {}
+            return {"runtime": runtime.as_dict(), "heads": [m.__dict__ for m in runtime.metrics]}
         return {
+            "runtime": runtime.as_dict(),
+            "heads": [m.__dict__ for m in runtime.metrics],
             "model_name": r["model_name"], "status": r["status"], "retrained": r["retrained"],
             "dataset_row_count": r["dataset_row_count"], "metrics": _json_value(r["metrics"]),
             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
@@ -297,12 +347,13 @@ def api_stats(start_date: str | None = None, end_date: str | None = None) -> dic
         cur.execute("SELECT COUNT(DISTINCT robot_id) AS n FROM public.robot_logs_error WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL;", (start, midpoint))
         active_prev = cur.fetchone()["n"] or 0
 
-        crit_q = """SELECT COUNT(DISTINCT robot_id) AS n FROM public.robot_logs_error
+        failure_sql, failure_params = _failure_condition_sql()
+        crit_q = f"""SELECT COUNT(DISTINCT robot_id) AS n FROM public.robot_logs_error
                     WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
-                      AND (LOWER(COALESCE(error_level,'')) IN ('critical','error','fatal') OR hourly_ratio >= 0.6);"""
-        cur.execute(crit_q, (start, end))
+                      AND ({failure_sql});"""
+        cur.execute(crit_q, [start, end, *failure_params])
         critical = cur.fetchone()["n"] or 0
-        cur.execute(crit_q, (start, midpoint))
+        cur.execute(crit_q, [start, midpoint, *failure_params])
         critical_prev = cur.fetchone()["n"] or 0
 
         fleet = (1 - critical / active) * 100 if active else 0
@@ -472,15 +523,18 @@ def api_fault_frequency(start_date: str | None = None, end_date: str | None = No
         """, (start, end))
         agg: dict[str, dict[str, int]] = {}
         order_keys: list[str] = []
+        category_order: list[str] = []
         for r in cur.fetchall():
             label = r["bkt"].strftime("%b %Y")
             if label not in agg:
-                agg[label] = {c: 0 for c in CATEGORY_ORDER}
+                agg[label] = {}
                 order_keys.append(label)
             cat = _category_for_error_type(r["etype"])
-            agg[label][cat] += int(r["cnt"])
+            if cat not in category_order:
+                category_order.append(cat)
+            agg[label][cat] = agg[label].get(cat, 0) + int(r["cnt"])
         labels = order_keys[-6:]
-        datasets = [{"label": cat, "data": [agg.get(l, {}).get(cat, 0) for l in labels]} for cat in CATEGORY_ORDER]
+        datasets = [{"label": cat, "data": [agg.get(l, {}).get(cat, 0) for l in labels]} for cat in sorted(category_order)]
         return {"labels": labels, "datasets": datasets}
 
 
@@ -591,7 +645,7 @@ def api_pred_heatmap(weeks: int = Query(8, ge=2, le=52)) -> dict[str, Any]:
 
 
 @app.get("/api/predictions/degradation")
-def api_pred_degradation(category: str = Query("Brush Motor Issues")) -> dict[str, Any]:
+def api_pred_degradation(category: str | None = None) -> dict[str, Any]:
     with get_cursor() as cur:
         start, end = _data_window(cur)
         cur.execute("""
@@ -602,8 +656,15 @@ def api_pred_degradation(category: str = Query("Brush Motor Issues")) -> dict[st
             WHERE task_time BETWEEN %s AND %s
             GROUP BY 1, 2 ORDER BY 1;
         """, (start, end))
+        trend_rows = cur.fetchall()
+        if not category:
+            category_counts: dict[str, int] = {}
+            for r in trend_rows:
+                cat = _category_for_error_type(r["etype"])
+                category_counts[cat] = category_counts.get(cat, 0) + 1
+            category = max(category_counts, key=category_counts.get) if category_counts else "Bilinmiyor"
         by_week: dict[str, list[float]] = {}
-        for r in cur.fetchall():
+        for r in trend_rows:
             if _category_for_error_type(r["etype"]) != category:
                 continue
             label = r["bkt"].strftime("%b %d")
@@ -644,71 +705,24 @@ def api_pred_degradation(category: str = Query("Brush Motor Issues")) -> dict[st
 @app.get("/api/predictions/stats")
 def api_pred_stats() -> dict[str, Any]:
     with get_cursor() as cur:
-        _start, end = _data_window(cur)
-        recent_start = end - timedelta(days=7)
-        prev_start = end - timedelta(days=14)
-
-        cur.execute("SELECT AVG(hourly_ratio) AS r FROM public.robot_logs_error WHERE task_time BETWEEN %s AND %s;", (recent_start, end))
-        ratio_now = float(cur.fetchone()["r"] or 0)
-        cur.execute("SELECT AVG(hourly_ratio) AS r FROM public.robot_logs_error WHERE task_time BETWEEN %s AND %s;", (prev_start, recent_start))
-        ratio_prev = float(cur.fetchone()["r"] or 0)
-        fleet_health = round((1 - ratio_now) * 100, 1)
-        fleet_health_prev = round((1 - ratio_prev) * 100, 1)
-
-        cur.execute("""
-            SELECT COUNT(*) AS n FROM (
-                SELECT robot_id, AVG(hourly_ratio) AS r
-                FROM public.robot_logs_error
-                WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
-                GROUP BY robot_id HAVING AVG(hourly_ratio) >= 0.6
-            ) q;
-        """, (recent_start, end))
-        high_risk = cur.fetchone()["n"] or 0
-        cur.execute("""
-            SELECT COUNT(*) AS n FROM (
-                SELECT robot_id, AVG(hourly_ratio) AS r
-                FROM public.robot_logs_error
-                WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
-                GROUP BY robot_id HAVING AVG(hourly_ratio) >= 0.6
-            ) q;
-        """, (prev_start, recent_start))
-        high_risk_prev = cur.fetchone()["n"] or 0
-
-        cur.execute("""
-            SELECT COUNT(*) AS n FROM (
-                SELECT DISTINCT ON (robot_id) robot_id, hourly_ratio
-                FROM public.robot_logs_error
-                WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
-                ORDER BY robot_id, task_time DESC
-            ) q WHERE hourly_ratio >= 0.8;
-        """, (recent_start, end))
-        pred_fail = cur.fetchone()["n"] or 0
-        cur.execute("""
-            SELECT COUNT(*) AS n FROM (
-                SELECT DISTINCT ON (robot_id) robot_id, hourly_ratio
-                FROM public.robot_logs_error
-                WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
-                ORDER BY robot_id, task_time DESC
-            ) q WHERE hourly_ratio >= 0.8;
-        """, (prev_start, recent_start))
-        pred_fail_prev = cur.fetchone()["n"] or 0
-
-        cur.execute("SELECT metrics FROM model_training.training_runs ORDER BY created_at DESC LIMIT 1;")
-        row = cur.fetchone()
+        snapshot = MODEL_RUNTIME.snapshot()
+        horizon_hours = snapshot.future_window_hours or 168
+        items, meta = _head_rows(cur, None, None, horizon_hours)
+        total = len(items)
+        current_failures = sum(1 for item in items if item["head_1"]["is_failure_now"])
+        future_failures = sum(1 for item in items if item["head_3"]["future_failure_observed"])
+        fleet_health = round((1 - current_failures / total) * 100, 1) if total else 0.0
         accuracy = 0.0
-        if row and row["metrics"]:
-            metrics = _json_value(row["metrics"])
-            if isinstance(metrics, dict):
-                accuracy = round(float(metrics.get("accuracy", 0)) * 100, 1)
-
-        def pct(now_v: float, prev_v: float) -> float:
-            return 0.0 if prev_v == 0 else round((now_v - prev_v) / prev_v * 100, 1)
+        head_1_metric = _metric_dict(snapshot, "head_1")
+        if head_1_metric and head_1_metric.get("values"):
+            accuracy = float(head_1_metric["values"].get("value_1", 0.0))
 
         return {
-            "fleet_health":   {"value": fleet_health,        "delta_pct": round(fleet_health - fleet_health_prev, 1)},
-            "high_risk":      {"value": high_risk,           "delta_pct": pct(high_risk, high_risk_prev)},
-            "predicted_fail": {"value": pred_fail,           "delta_pct": pct(pred_fail, pred_fail_prev)},
-            "model_accuracy": {"value": accuracy,            "delta_pct": 1.8},
+            "fleet_health":   {"value": fleet_health,        "delta_pct": 0.0},
+            "high_risk":      {"value": future_failures,     "delta_pct": 0.0},
+            "predicted_fail": {"value": current_failures,    "delta_pct": 0.0},
+            "model_accuracy": {"value": accuracy,            "delta_pct": 0.0},
+            "source": meta["source"],
         }
 
 
@@ -717,21 +731,23 @@ def api_notifications(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
     """Recent high-severity events as notifications for the bell dropdown."""
     with get_cursor() as cur:
         _start, end = _data_window(cur)
-        cur.execute("""
+        failure_sql, failure_params = _failure_condition_sql()
+        cur.execute(f"""
             SELECT robot_id, error_type, error_detail, error_level, hourly_ratio, task_time
             FROM public.robot_logs_error
             WHERE robot_id IS NOT NULL
-              AND (LOWER(COALESCE(error_level,'')) IN ('critical','error','fatal') OR hourly_ratio >= 0.6)
+              AND ({failure_sql})
             ORDER BY task_time DESC
             LIMIT %s;
-        """, (limit,))
+        """, [*failure_params, limit])
         rows = cur.fetchall()
         items = []
         for r in rows:
             tt = r["task_time"]
             if isinstance(tt, datetime) and tt.tzinfo is not None:
                 tt = tt.replace(tzinfo=None)
-            severity = "critical" if (r["hourly_ratio"] or 0) >= 0.8 else "warning"
+            score = MODEL_RUNTIME.severity_score(r["error_level"])
+            severity = "critical" if score is not None and score >= 2 else "warning"
             items.append({
                 "robot_id": r["robot_id"],
                 "title": r["error_type"] or "Unknown fault",
@@ -747,1443 +763,587 @@ def api_notifications(limit: int = Query(10, ge=1, le=50)) -> dict[str, Any]:
 @app.get("/api/predictions/top-failures")
 def api_top_failures() -> dict[str, Any]:
     with get_cursor() as cur:
-        _start, end = _data_window(cur)
-        recent = end - timedelta(days=30)
-        cur.execute("""
-            SELECT DISTINCT ON (robot_id)
-                   robot_id, product_code, error_type, error_detail, hourly_ratio, task_time
-            FROM public.robot_logs_error
-            WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
-            ORDER BY robot_id, task_time DESC;
-        """, (recent, end))
-        rows = cur.fetchall()
+        snapshot = MODEL_RUNTIME.snapshot()
+        horizon_hours = snapshot.future_window_hours or 168
+        rows, meta = _head_rows(cur, None, None, horizon_hours)
         items = []
         for r in rows:
-            prob = round(float(r["hourly_ratio"] or 0) * 100, 0)
-            if prob >= 80: risk = "Critical Risk"
-            elif prob >= 60: risk = "High Risk"
-            elif prob >= 40: risk = "Medium Risk"
-            else: risk = "Low Risk"
+            hours = r["head_4"]["est_hours_to_failure"]
+            current = r["head_1"]["is_failure_now"]
+            future = r["head_3"]["future_failure_observed"]
+            probability = r["head_1"]["failure_prob_now"]
+            if future and probability is None:
+                probability = 100.0
             items.append({
                 "robot_id": r["robot_id"],
-                "area": r["product_code"] or "Unknown",
-                "failure_probability": prob,
-                "risk_level": risk,
-                "predicted_issue": r["error_type"] or "Unknown",
+                "area": r["area"],
+                "failure_probability": probability,
+                "risk_level": "Current failure" if current else ("Future failure observed" if future else "No future failure observed"),
+                "predicted_issue": r["error_type"],
                 "predicted_detail": r["error_detail"] or "Operational",
-                "estimated_time": r["task_time"].isoformat() if r["task_time"] else None,
-                "category": _category_for_error_type(r["error_type"]),
+                "estimated_time": hours,
+                "estimated_time_label": r["head_4"]["est_time_label"],
+                "category": r["component"],
+                "source": meta["source"],
             })
-        items.sort(key=lambda x: -x["failure_probability"])
+        items.sort(key=lambda x: (x["estimated_time"] is None, x["estimated_time"] or 10**9, -(x["failure_probability"] or 0)))
         return {"items": items[:10]}
+
+
+# ============================================================================
+# API: model-head dashboard
+# ============================================================================
+def _head_reference_rows(
+    cur,
+    start_date: str | None,
+    end_date: str | None,
+    horizon_hours: int,
+    robot: str | None = None,
+) -> tuple[list[dict[str, Any]], datetime, datetime]:
+    ext_start, ext_end = _data_window(cur)
+    start = _parse_date(start_date) or ext_start
+    reference = _parse_date(end_date, end_of_day=True)
+    if reference is None:
+        snapshot = MODEL_RUNTIME.snapshot()
+        if snapshot.engine_available:
+            reference = ext_end
+        else:
+            reference = max(ext_start, ext_end - timedelta(hours=horizon_hours))
+    if start < ext_start:
+        start = ext_start
+    if reference > ext_end:
+        reference = ext_end
+    if start > reference:
+        start = ext_start
+    sql = """
+        SELECT DISTINCT ON (robot_id)
+               robot_id, product_code, error_type, error_detail, error_level,
+               hourly_ratio, hourly_error_count, pair_max_hourly_count, task_time
+        FROM public.robot_logs_error
+        WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
+    """
+    params: list[Any] = [start, reference]
+    if robot and robot.lower() not in ("all", "all robots"):
+        sql += " AND robot_id = %s"
+        params.append(robot)
+    sql += " ORDER BY robot_id, task_time DESC;"
+    cur.execute(sql, params)
+    return cur.fetchall(), start, reference
+
+
+def _future_failures_by_robot(
+    cur,
+    reference: datetime,
+    horizon_hours: int,
+    robot_ids: list[str],
+) -> tuple[dict[str, dict[str, Any]], datetime, bool]:
+    if not robot_ids:
+        return {}, reference, False
+    _data_start, data_end = _data_window(cur)
+    requested_end = reference + timedelta(hours=horizon_hours)
+    observed_end = min(requested_end, data_end)
+    if observed_end <= reference:
+        return {}, observed_end, False
+
+    failure_sql, failure_params = _failure_condition_sql("error_level")
+    placeholders = ",".join(["%s"] * len(robot_ids))
+    cur.execute(
+        f"""
+        SELECT robot_id,
+               MIN(task_time) AS next_failure_time,
+               COUNT(*) AS future_failure_events,
+               MAX(hourly_ratio) AS max_future_ratio
+        FROM public.robot_logs_error
+        WHERE task_time > %s
+          AND task_time <= %s
+          AND robot_id IN ({placeholders})
+          AND ({failure_sql})
+        GROUP BY robot_id;
+        """,
+        [reference, observed_end, *robot_ids, *failure_params],
+    )
+    rows = {r["robot_id"]: r for r in cur.fetchall()}
+    return rows, observed_end, requested_end <= data_end
+
+
+def _model_source(snapshot: RuntimeSnapshot) -> str:
+    return "lstm_v2_inference" if snapshot.engine_available else "dataset_target_replay"
+
+
+def _head_rows(
+    cur,
+    start_date: str | None,
+    end_date: str | None,
+    horizon_hours: int,
+    robot: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    snapshot = MODEL_RUNTIME.snapshot()
+    rows, start, reference = _head_reference_rows(cur, start_date, end_date, horizon_hours, robot)
+    robot_ids = [r["robot_id"] for r in rows if r["robot_id"]]
+    future_by_robot, observed_end, complete = _future_failures_by_robot(cur, reference, horizon_hours, robot_ids)
+
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        robot_id = r["robot_id"]
+        future = future_by_robot.get(robot_id)
+        next_time = future["next_failure_time"] if future else None
+        hours_to_failure = None
+        if next_time:
+            hours_to_failure = max(0.0, round((next_time - reference).total_seconds() / 3600, 1))
+
+        severity_score = MODEL_RUNTIME.severity_score(r["error_level"])
+        severity_label = snapshot.severity_labels.get(severity_score, r["error_level"] or "Unknown") if severity_score is not None else (r["error_level"] or "Unknown")
+        severity_tr = snapshot.severity_labels_tr.get(severity_score, severity_label) if severity_score is not None else severity_label
+        current_failure = MODEL_RUNTIME.is_failure_level(r["error_level"])
+        future_failure = bool(future)
+        evidence_ratio = float(r["hourly_ratio"] or 0)
+
+        items.append({
+            "robot_id": robot_id,
+            "area": r["product_code"] or "Unknown",
+            "last_observed_at": r["task_time"].isoformat() if r["task_time"] else None,
+            "error_type": r["error_type"] or "Unknown",
+            "error_detail": r["error_detail"] or "",
+            "component": _category_for_error_type(r["error_type"]),
+            "status": _classify_status(r["error_level"], r["hourly_ratio"]),
+            "head_1": {
+                "name": "Anlık arıza",
+                "is_failure_now": current_failure,
+                "failure_prob_now": _pct(evidence_ratio),
+                "source": _model_source(snapshot),
+            },
+            "head_2": {
+                "name": "Şiddet",
+                "severity_now": severity_label,
+                "severity_now_tr": severity_tr,
+                "severity_score": severity_score,
+                "source": _model_source(snapshot),
+            },
+            "head_3": {
+                "name": "7 günlük öngörü",
+                "future_failure_observed": future_failure,
+                "future_failure_events": int(future["future_failure_events"]) if future else 0,
+                "next_7d_fail_prob": 100.0 if future_failure and not snapshot.engine_available else None,
+                "source": _model_source(snapshot),
+            },
+            "head_4": {
+                "name": "Arıza süresi",
+                "est_hours_to_failure": hours_to_failure,
+                "est_time_label": _format_hours(hours_to_failure),
+                "source": _model_source(snapshot),
+            },
+        })
+
+    items.sort(
+        key=lambda x: (
+            not x["head_1"]["is_failure_now"],
+            not x["head_3"]["future_failure_observed"],
+            x["head_4"]["est_hours_to_failure"] if x["head_4"]["est_hours_to_failure"] is not None else 10**9,
+            -(x["head_2"]["severity_score"] or -1),
+            x["robot_id"],
+        )
+    )
+
+    meta = {
+        "range": {"start": start.isoformat(), "end": reference.isoformat()},
+        "reference_time": reference.isoformat(),
+        "horizon_hours": horizon_hours,
+        "observed_horizon_end": observed_end.isoformat(),
+        "future_window_complete": complete,
+        "source": _model_source(snapshot),
+        "runtime": snapshot.as_dict(),
+    }
+    return items, meta
+
+
+@app.get("/api/model-runtime")
+def api_model_runtime() -> dict[str, Any]:
+    return MODEL_RUNTIME.snapshot().as_dict()
+
+
+@app.get("/api/model-heads/summary")
+def api_model_heads_summary(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    horizon_days: int = Query(7, ge=1, le=30),
+) -> dict[str, Any]:
+    with get_cursor() as cur:
+        snapshot = MODEL_RUNTIME.snapshot()
+        horizon_hours = snapshot.future_window_hours or horizon_days * 24
+        items, meta = _head_rows(cur, start_date, end_date, horizon_hours)
+        total = len(items)
+        current_failures = sum(1 for item in items if item["head_1"]["is_failure_now"])
+        future_failures = sum(1 for item in items if item["head_3"]["future_failure_observed"])
+        hours = [item["head_4"]["est_hours_to_failure"] for item in items if item["head_4"]["est_hours_to_failure"] is not None]
+        severity_counts: dict[str, int] = {}
+        component_counts: dict[str, int] = {}
+        for item in items:
+            sev = item["head_2"]["severity_now_tr"]
+            comp = item["component"]
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            component_counts[comp] = component_counts.get(comp, 0) + 1
+
+        return {
+            **meta,
+            "total_robots": total,
+            "heads": [
+                {
+                    "id": "head_1",
+                    "name": "Anlık arıza",
+                    "metric": _metric_dict(snapshot, "head_1"),
+                    "value": current_failures,
+                    "unit": "robots",
+                    "detail": f"{current_failures} / {total} robot",
+                },
+                {
+                    "id": "head_2",
+                    "name": "Şiddet",
+                    "metric": _metric_dict(snapshot, "head_2"),
+                    "value": severity_counts,
+                    "unit": "distribution",
+                    "detail": max(severity_counts, key=severity_counts.get) if severity_counts else "No data",
+                },
+                {
+                    "id": "head_3",
+                    "name": "7 günlük öngörü",
+                    "metric": _metric_dict(snapshot, "head_3"),
+                    "value": future_failures,
+                    "unit": "robots",
+                    "detail": f"{future_failures} robot / {horizon_hours // 24} gün",
+                },
+                {
+                    "id": "head_4",
+                    "name": "Arıza süresi",
+                    "metric": _metric_dict(snapshot, "head_4"),
+                    "value": round(sum(hours) / len(hours), 1) if hours else None,
+                    "unit": "hours",
+                    "detail": _format_hours(round(sum(hours) / len(hours), 1) if hours else None),
+                },
+            ],
+            "severity_counts": severity_counts,
+            "component_counts": component_counts,
+        }
+
+
+@app.get("/api/model-heads/robots")
+def api_model_head_robots(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    robot: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    horizon_days: int = Query(7, ge=1, le=30),
+) -> dict[str, Any]:
+    with get_cursor() as cur:
+        snapshot = MODEL_RUNTIME.snapshot()
+        horizon_hours = snapshot.future_window_hours or horizon_days * 24
+        items, meta = _head_rows(cur, start_date, end_date, horizon_hours, robot)
+        total = len(items)
+        start_idx = (page - 1) * page_size
+        return {
+            **meta,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "items": items[start_idx:start_idx + page_size],
+        }
+
+
+@app.get("/api/model-heads/timeline")
+def api_model_head_timeline(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    horizon_days: int = Query(7, ge=1, le=30),
+) -> dict[str, Any]:
+    with get_cursor() as cur:
+        snapshot = MODEL_RUNTIME.snapshot()
+        horizon_hours = snapshot.future_window_hours or horizon_days * 24
+        _rows, _start, reference = _head_reference_rows(cur, start_date, end_date, horizon_hours)
+        _data_start, data_end = _data_window(cur)
+        requested_end = reference + timedelta(hours=horizon_hours)
+        observed_end = min(requested_end, data_end)
+        if observed_end <= reference:
+            return {
+                "reference_time": reference.isoformat(),
+                "horizon_hours": horizon_hours,
+                "observed_horizon_end": observed_end.isoformat(),
+                "future_window_complete": False,
+                "points": [],
+            }
+
+        failure_sql, failure_params = _failure_condition_sql("error_level")
+        cur.execute(
+            f"""
+            SELECT date_trunc('day', task_time) AS bkt,
+                   COUNT(DISTINCT robot_id) AS robots,
+                   COUNT(*) AS events
+            FROM public.robot_logs_error
+            WHERE task_time > %s
+              AND task_time <= %s
+              AND ({failure_sql})
+            GROUP BY 1 ORDER BY 1;
+            """,
+            [reference, observed_end, *failure_params],
+        )
+        return {
+            "reference_time": reference.isoformat(),
+            "horizon_hours": horizon_hours,
+            "observed_horizon_end": observed_end.isoformat(),
+            "future_window_complete": requested_end <= data_end,
+            "source": _model_source(snapshot),
+            "points": [
+                {
+                    "date": r["bkt"].isoformat(),
+                    "robots": int(r["robots"] or 0),
+                    "events": int(r["events"] or 0),
+                }
+                for r in cur.fetchall()
+            ],
+        }
 
 
 # ============================================================================
 # Frontend
 # ============================================================================
 INDEX_HTML = r"""<!DOCTYPE html>
-<html lang="en">
+<html lang="tr">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>RoboClean - Predictive Maintenance</title>
+<title>PUDU LSTM V2 Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
 :root{
-  --sidebar-bg:#1f2a44;--sidebar-bg-2:#1a2540;--sidebar-fg:#cfd6e6;--sidebar-fg-mute:#8a96b3;
-  --sidebar-active:#3b82f6;--bg:#f5f7fb;--card:#fff;--border:#e5e9f2;--text:#1f2937;--text-mute:#6b7280;
-  --primary:#3b82f6;--primary-2:#2563eb;
-  --green:#10b981;--green-soft:#d1fae5;--red:#ef4444;--red-soft:#fee2e2;
-  --amber:#f59e0b;--amber-soft:#fef3c7;--blue-soft:#dbeafe;
-  --purple:#a855f7;--purple-soft:#f3e8ff;
-  --cat-brush:#3b82f6;--cat-battery:#10b981;--cat-nav:#f59e0b;--cat-vacuum:#a855f7;--cat-other:#94a3b8;
-  --shadow:0 1px 2px rgba(15,23,42,.04),0 1px 3px rgba(15,23,42,.06);--radius:12px;
+  --bg:#f4f6f8;--panel:#fff;--panel-2:#f9fafb;--line:#dfe5ec;--text:#172033;--muted:#647084;
+  --ink:#0e1726;--blue:#2563eb;--teal:#0f766e;--green:#16a34a;--amber:#d97706;--red:#dc2626;
+  --blue-soft:#dbeafe;--teal-soft:#ccfbf1;--green-soft:#dcfce7;--amber-soft:#fef3c7;--red-soft:#fee2e2;
+  --shadow:0 1px 2px rgba(15,23,42,.05),0 8px 24px rgba(15,23,42,.06);--r:8px;
 }
-*{box-sizing:border-box}html,body{margin:0;padding:0;overflow-x:hidden}
-body{font-family:'Inter',-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
-  background:var(--bg);color:var(--text);font-size:14px;-webkit-font-smoothing:antialiased}
-a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
-
-.app{display:flex;min-height:100vh;max-width:100vw;overflow-x:hidden}
-.sidebar{width:248px;background:linear-gradient(180deg,var(--sidebar-bg),var(--sidebar-bg-2));
-  color:var(--sidebar-fg);display:flex;flex-direction:column;justify-content:space-between;
-  padding:18px 14px;position:sticky;top:0;height:100vh;flex-shrink:0}
-.brand{display:flex;align-items:center;gap:10px;padding:6px 8px 18px;
-  border-bottom:1px solid rgba(255,255,255,.06);margin-bottom:12px}
-.brand-logo{width:38px;height:38px;border-radius:10px;
-  background:linear-gradient(135deg,#3b82f6,#60a5fa);display:grid;place-items:center;color:#fff}
-.brand-title{font-weight:700;font-size:16px;color:#fff}
-.brand-sub{font-size:11px;color:var(--sidebar-fg-mute)}
-.nav{display:flex;flex-direction:column;gap:2px}
-.nav-item{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:8px;
-  color:var(--sidebar-fg);font-size:13.5px;transition:background .15s;cursor:pointer;
-  border:none;background:transparent;width:100%;text-align:left}
-.nav-item:hover{background:rgba(255,255,255,.05)}
-.nav-item.active{background:var(--sidebar-active);color:#fff;box-shadow:0 4px 14px rgba(59,130,246,.35)}
-.nav-icon{width:18px;text-align:center;opacity:.9}
-.nav-label{flex:1}.nav-arrow{color:var(--sidebar-fg-mute)}
-
-.sidebar-bottom{display:flex;flex-direction:column;gap:10px;padding:8px}
-.status-card,.user-card{display:flex;align-items:center;gap:10px;background:rgba(255,255,255,.04);
-  padding:10px 12px;border-radius:10px}
-.status-dot{width:9px;height:9px;border-radius:50%;background:#10b981;
-  box-shadow:0 0 0 4px rgba(16,185,129,.18)}
-.status-title{font-size:12.5px;font-weight:600;color:#fff}
-.status-sub{font-size:11px;color:var(--sidebar-fg-mute)}
-.user-avatar{width:36px;height:36px;border-radius:50%;
-  background:linear-gradient(135deg,#6366f1,#3b82f6);color:#fff;display:grid;place-items:center;
-  font-size:12px;font-weight:700}
-.user-meta{flex:1;min-width:0}
-.user-name{font-size:12.5px;font-weight:600;color:#fff}
-.user-mail{font-size:11px;color:var(--sidebar-fg-mute);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.user-caret{color:var(--sidebar-fg-mute)}
-
-.main{flex:1;padding:24px 28px 32px;min-width:0;max-width:100%;overflow-x:hidden}
-.topbar{display:flex;justify-content:space-between;align-items:flex-start;
-  gap:16px;flex-wrap:wrap;margin-bottom:20px}
-.hamburger{display:none;border:1px solid var(--border);background:#fff;
-  width:38px;height:38px;border-radius:8px;font-size:18px}
-.topbar-left h1{margin:0 0 4px;font-size:22px;font-weight:700}
-.topbar-left p{margin:0;color:var(--text-mute);font-size:13px}
-.topbar-right{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.bell{position:relative;width:38px;height:38px;border:1px solid var(--border);
-  background:#fff;border-radius:50%;font-size:16px}
-.bell-badge{position:absolute;top:-2px;right:-2px;background:var(--red);color:#fff;
-  border-radius:999px;padding:1px 6px;font-size:10px;font-weight:700;border:2px solid #fff}
-.date-picker{background:#fff;border:1px solid var(--border);padding:8px 14px;
-  border-radius:8px;font-size:13px;cursor:pointer;font-family:inherit;color:inherit}
-.date-picker:hover{background:#f9fafc}
-.bell{cursor:pointer}
-.bell:hover{background:#f9fafc}
-.topbar-right{position:relative}
-
-/* popovers */
-.popover{position:absolute;top:48px;right:0;background:#fff;border:1px solid var(--border);
-  border-radius:12px;box-shadow:0 10px 30px rgba(15,23,42,.18);
-  z-index:60;padding:14px;min-width:260px}
-.popover[hidden]{display:none}
-.popover h4{margin:0 0 10px;font-size:13px;font-weight:700}
-.popover .row{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
-.popover .row label{font-size:11px;color:var(--text-mute);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
-.popover .row input{border:1px solid var(--border);padding:8px 10px;border-radius:8px;font-size:13px;
-  font-family:inherit;color:var(--text);background:#fff}
-.popover .quick{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-bottom:10px}
-.popover .quick button{font-size:11.5px;padding:6px 8px;border-radius:7px;border:1px solid var(--border);
-  background:#f9fafc;color:var(--text);cursor:pointer}
-.popover .quick button:hover{background:#eef2f7}
-.popover .actions{display:flex;gap:6px;justify-content:flex-end}
-.popover .actions button{padding:6px 14px;border-radius:8px;font-size:12.5px;font-weight:600;cursor:pointer;
-  border:1px solid var(--border);background:#fff;color:var(--text)}
-.popover .actions .primary{background:var(--primary);color:#fff;border-color:var(--primary)}
-.popover .actions .primary:hover{background:var(--primary-2)}
-
-.notif-panel{position:absolute;top:48px;right:64px;background:#fff;border:1px solid var(--border);
-  border-radius:12px;box-shadow:0 10px 30px rgba(15,23,42,.18);
-  z-index:60;width:340px;max-width:calc(100vw - 32px);max-height:420px;display:flex;flex-direction:column}
-.notif-panel[hidden]{display:none}
-.notif-head{padding:12px 14px;border-bottom:1px solid var(--border);
-  display:flex;justify-content:space-between;align-items:center}
-.notif-head h4{margin:0;font-size:14px;font-weight:700}
-.notif-head .clear{background:transparent;border:none;color:var(--primary);font-size:12px;cursor:pointer}
-.notif-list{list-style:none;margin:0;padding:0;overflow:auto;flex:1}
-.notif-list li{padding:12px 14px;border-bottom:1px solid var(--border);
-  display:grid;grid-template-columns:6px 1fr auto;gap:10px;align-items:start}
-.notif-list li:last-child{border-bottom:none}
-.notif-list .sev{width:6px;align-self:stretch;border-radius:3px}
-.notif-list .sev.critical{background:var(--red)}
-.notif-list .sev.warning{background:var(--amber)}
-.notif-list .title{font-weight:600;font-size:13px;color:var(--text);margin-bottom:2px}
-.notif-list .body{font-size:11.5px;color:var(--text-mute);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
-.notif-list .when{font-size:10.5px;color:var(--text-mute);white-space:nowrap}
-.notif-empty{padding:30px;text-align:center;color:var(--text-mute);font-size:13px}
-
-.card{background:var(--card);border-radius:var(--radius);border:1px solid var(--border);
-  box-shadow:var(--shadow);padding:20px}
-.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;margin-bottom:18px}
-.stat{position:relative;display:grid;grid-template-columns:64px 1fr auto;grid-template-rows:auto auto;
-  align-items:center;column-gap:14px;overflow:hidden;padding-bottom:26px}
-.stat-icon{width:56px;height:56px;border-radius:14px;display:grid;place-items:center;grid-row:span 2}
-.icon-blue{background:var(--blue-soft);color:#3b82f6}
-.icon-red{background:var(--red-soft);color:var(--red)}
-.icon-green{background:var(--green-soft);color:var(--green)}
-.icon-purple{background:var(--purple-soft);color:var(--purple)}
-.icon-amber{background:var(--amber-soft);color:var(--amber)}
-.stat-body{min-width:0}
-.stat-title{font-size:13px;color:var(--text-mute);font-weight:600;margin-bottom:4px}
-.stat-value{font-size:30px;font-weight:700;line-height:1.1}
-.stat-sub{font-size:12px;color:var(--text-mute);margin-top:2px}
-.stat-trend{text-align:right}
-.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700}
-.badge-up{background:var(--green-soft);color:#047857}
-.badge-down{background:var(--red-soft);color:#b91c1c}
-.badge-flat{background:#f3f4f6;color:#4b5563}
-.trend-sub{display:block;font-size:11px;color:var(--text-mute);margin-top:4px}
-.stat-bar{position:absolute;bottom:0;left:0;right:0;height:4px;background:#f1f3f7}
-.stat-bar-fill{height:100%;transition:width .6s ease}
-.stat-bar-fill.blue{background:var(--primary)}
-.stat-bar-fill.red{background:var(--red)}
-.stat-bar-fill.green{background:var(--green)}
-.stat-bar-fill.purple{background:var(--purple)}
-.stat-bar-fill.amber{background:var(--amber)}
-
-.charts{display:grid;grid-template-columns:1.4fr 1fr;gap:18px;margin-bottom:18px}
-.chart-card{display:flex;flex-direction:column}
-.chart-head{display:flex;justify-content:space-between;align-items:center;
-  margin-bottom:14px;gap:12px;flex-wrap:wrap}
-.chart-head h3{margin:0;font-size:15px;font-weight:600}
-.info{color:var(--text-mute);font-size:12px;cursor:help}
-.chart-body{position:relative;height:260px}
-.donut-wrap{display:flex;align-items:center;gap:24px;justify-content:center;height:100%}
-.donut-wrap canvas{flex:0 0 200px;max-width:200px;max-height:200px}
-.donut-wrap .legend{min-width:200px;max-width:260px;flex:1}
-.legend{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px}
-.legend li{display:flex;align-items:center;justify-content:space-between;font-size:13px;gap:12px}
-.legend .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:8px}
-.legend .value{font-weight:600;white-space:nowrap}
-.legend .pct{color:var(--text-mute);margin-left:4px}
-
-.table-card{padding-bottom:14px}
-.table-head{display:flex;justify-content:space-between;align-items:center;
-  margin-bottom:14px;gap:12px;flex-wrap:wrap}
-.table-head h3{margin:0;font-size:15px;font-weight:600}
-.table-controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-.search{position:relative}
-.search-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);
-  font-size:12px;color:var(--text-mute);pointer-events:none}
-.search input{border:1px solid var(--border);padding:8px 12px 8px 30px;border-radius:8px;
-  background:#fff;font-size:13px;width:220px}
-.select,.input-date{border:1px solid var(--border);padding:8px 32px 8px 12px;border-radius:8px;
-  background:#fff url("data:image/svg+xml;utf8,<svg fill='none' stroke='%236b7280' stroke-width='2' viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'><polyline points='6 9 12 15 18 9'/></svg>") no-repeat right 10px center;
-  background-size:12px;appearance:none;font-size:13px;min-width:150px}
-.input-date{background:#fff;padding:8px 12px}
-.btn-ghost{background:#fff;border:1px solid var(--border);padding:8px 14px;border-radius:8px;
-  font-size:13px;font-weight:500;color:var(--text);display:inline-flex;align-items:center;gap:6px}
-.btn-ghost:hover{background:#f9fafc}
-
-.table-wrap{overflow-x:auto}
-table.data{width:100%;border-collapse:collapse;font-size:13.5px}
-table.data thead th{text-align:left;padding:10px 14px;border-bottom:1px solid var(--border);
-  color:var(--text-mute);font-weight:600;font-size:12.5px;background:#fafbfc;white-space:nowrap}
-table.data tbody td{padding:14px;border-bottom:1px solid var(--border);vertical-align:middle}
-table.data tbody tr:hover{background:#f9fafc}
-table.data tbody tr:last-child td{border-bottom:none}
-.action-col{text-align:right;white-space:nowrap}
-
-.robot-id-cell{display:flex;align-items:center;gap:10px}
-.robot-thumb{width:40px;height:40px;border-radius:50%;background:#f1f5f9;
-  display:grid;place-items:center;flex-shrink:0;color:#475569}
-.robot-id{font-weight:600}
-.robot-area{font-size:11.5px;color:var(--text-mute)}
-
-.status{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;
-  font-size:12px;font-weight:600}
-.status::before{content:"";width:6px;height:6px;border-radius:50%}
-.status.critical{background:var(--red-soft);color:#b91c1c}
-.status.critical::before{background:var(--red)}
-.status.warning{background:var(--amber-soft);color:#b45309}
-.status.warning::before{background:var(--amber)}
-.status.normal{background:var(--green-soft);color:#047857}
-.status.normal::before{background:var(--green)}
-.status.resolved{background:var(--green-soft);color:#047857}
-.status.resolved::before{background:var(--green)}
-.status.in-progress{background:var(--amber-soft);color:#b45309}
-.status.in-progress::before{background:var(--amber)}
-
-.cat-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}
-.fault-name{font-weight:500}
-.fault-detail{font-size:11.5px;color:var(--text-mute);max-width:300px;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.confidence{display:flex;align-items:center;gap:10px;min-width:130px}
-.confidence-num{width:36px;font-weight:600;font-size:12.5px}
-.confidence-bar{flex:1;height:6px;border-radius:999px;background:#f1f3f7;overflow:hidden}
-.confidence-fill{height:100%;border-radius:999px}
-.confidence-fill.red{background:var(--red)}
-.confidence-fill.amber{background:var(--amber)}
-.confidence-fill.green{background:var(--green)}
-
-.btn-secondary{background:var(--primary);color:#fff;border:none;padding:6px 14px;
-  border-radius:8px;font-size:12.5px;font-weight:600;transition:background .15s}
-.btn-secondary:hover{background:var(--primary-2)}
-.icon-btn{background:#fff;border:1px solid var(--border);width:32px;height:32px;
-  border-radius:8px;color:var(--text-mute);display:inline-grid;place-items:center;margin-left:4px;
-  cursor:pointer}
-.icon-btn:hover{color:var(--text)}
-.kebab{background:transparent;border:none;color:var(--text-mute);padding:4px 8px;font-size:16px;line-height:1}
-.empty{text-align:center;padding:40px;color:var(--text-mute)}
-
-.table-foot{display:flex;justify-content:space-between;align-items:center;
-  padding:14px 4px 4px;flex-wrap:wrap;gap:10px}
-.pagination-info{font-size:12.5px;color:var(--text-mute)}
-.pagination{display:flex;gap:4px}
-.pagination button{border:1px solid var(--border);background:#fff;width:32px;height:32px;
-  border-radius:6px;font-size:12.5px;color:var(--text)}
-.pagination button.active{background:var(--primary);color:#fff;border-color:var(--primary)}
-.pagination button:disabled{opacity:.4;cursor:not-allowed}
-
-.modal-backdrop[hidden]{display:none}
-.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.55);
-  display:grid;place-items:center;padding:20px;z-index:100}
-.modal{background:#fff;border-radius:14px;width:min(640px,100%);max-height:85vh;
-  overflow:hidden;display:flex;flex-direction:column;
-  box-shadow:0 20px 50px rgba(15,23,42,.25)}
-.modal-head{display:flex;justify-content:space-between;align-items:center;
-  padding:16px 20px;border-bottom:1px solid var(--border)}
-.modal-head h2{margin:0;font-size:16px}
-.modal-close{border:none;background:transparent;font-size:18px;color:var(--text-mute);cursor:pointer}
-.modal-body{padding:18px 20px;overflow:auto;font-size:13.5px}
-.modal-body .meta-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
-  gap:8px 20px;margin-bottom:16px}
-.modal-body .meta-grid div{display:flex;flex-direction:column}
-.modal-body .meta-grid .k{font-size:11.5px;color:var(--text-mute);
-  text-transform:uppercase;letter-spacing:.04em}
-.modal-body .meta-grid .v{font-weight:600;word-break:break-all}
-.modal-body h4{margin:18px 0 8px;font-size:13px}
-.modal-body table{width:100%;border-collapse:collapse;font-size:12.5px}
-.modal-body table th,.modal-body table td{padding:8px 6px;
-  border-bottom:1px solid var(--border);text-align:left}
-
-.page{display:none}
-.page.active{display:block}
-
-.bar-chart-wrap{position:relative;height:280px}
-.filter-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;
-  padding:14px;background:#fff;border:1px solid var(--border);
-  border-radius:var(--radius);margin-bottom:18px}
-.filter-row .arrow{color:var(--text-mute)}
-.cat-legend{display:flex;flex-direction:column;gap:8px;padding-left:8px}
-.cat-legend li{display:flex;align-items:center;font-size:12.5px;gap:8px;color:var(--text)}
-.cat-legend .dot{width:9px;height:9px;border-radius:50%}
-
-.heat-card,.degr-card{padding:20px}
-.preds-row{display:grid;grid-template-columns:1fr 1.4fr;gap:18px;margin-bottom:18px}
-.heatmap{display:grid;gap:6px;align-items:center;margin-top:10px}
-.heatmap .row{display:flex;align-items:center;gap:6px}
-.heatmap .rlabel{font-size:11px;color:var(--text-mute);width:120px;white-space:nowrap;
-  overflow:hidden;text-overflow:ellipsis}
-.heatmap .cell{flex:1;height:30px;border-radius:6px;min-width:30px}
-.heatmap .clabels{display:flex;gap:6px;padding-left:126px;color:var(--text-mute);font-size:10.5px;margin-top:6px}
-.heatmap .clabels span{flex:1;text-align:center;min-width:30px}
-.heat-legend{display:flex;flex-direction:column;align-items:center;gap:6px;font-size:11px;
-  color:var(--text-mute);margin-left:10px}
-.heat-legend .bar{width:14px;height:100px;border-radius:6px;
-  background:linear-gradient(180deg,#ef4444,#f59e0b,#10b981)}
-
-.degr-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:10px}
-.degr-grid .mini{position:relative;height:220px}
-.degr-grid h4{margin:0 0 6px;font-size:13px;font-weight:600}
-.degr-grid .pred-badge{position:absolute;top:0;right:0;background:var(--red-soft);
-  color:#b91c1c;font-size:11px;padding:4px 8px;border-radius:6px;font-weight:600;
-  text-align:center;line-height:1.2;z-index:2}
-
-.pred-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:14px}
-.pred-card{background:#fff;border:1px solid var(--border);border-radius:var(--radius);
-  padding:16px;display:flex;flex-direction:column;gap:10px;
-  border-top:3px solid var(--cat-other)}
-.pred-card.Critical{border-top-color:var(--red)}
-.pred-card.High{border-top-color:var(--amber)}
-.pred-card.Medium{border-top-color:#facc15}
-.pred-card.Low{border-top-color:var(--green)}
-.pred-card .head{display:flex;align-items:center;gap:10px}
-.pred-card .head .thumb{width:36px;height:36px;border-radius:50%;background:#f1f5f9;
-  display:grid;place-items:center;color:#475569}
-.pred-card .head .id{font-weight:700;font-size:13.5px}
-.pred-card .head .area{font-size:11px;color:var(--text-mute)}
-.pred-card .prob-row{display:flex;align-items:center;justify-content:space-between}
-.pred-card .prob{font-size:22px;font-weight:700}
-.pred-card .risk-pill{font-size:11px;padding:3px 8px;border-radius:999px;font-weight:600}
-.pred-card .risk-pill.Critical{background:var(--red-soft);color:#b91c1c}
-.pred-card .risk-pill.High{background:var(--amber-soft);color:#b45309}
-.pred-card .risk-pill.Medium{background:#fef9c3;color:#a16207}
-.pred-card .risk-pill.Low{background:var(--green-soft);color:#047857}
-.pred-card .label-sm{font-size:11px;color:var(--text-mute);text-transform:uppercase;letter-spacing:.04em}
-.pred-card .issue{font-weight:600;font-size:13px}
-.pred-card .time{font-size:12.5px;color:var(--text)}
-.pred-card .btn-view{background:#fff;color:var(--primary);border:1px solid var(--primary);
-  padding:6px 10px;border-radius:8px;font-weight:600;font-size:12.5px;width:100%;cursor:pointer}
-.pred-card .btn-view:hover{background:var(--primary);color:#fff}
-
-@media (max-width:1100px){.charts,.preds-row{grid-template-columns:1fr}
-  .donut-wrap{flex-wrap:wrap}
-  .degr-grid{grid-template-columns:1fr}}
-@media (max-width:880px){.cards{grid-template-columns:1fr}
-  .stat{grid-template-columns:56px 1fr auto}}
-@media (max-width:760px){.sidebar{position:fixed;left:0;top:0;transform:translateX(-100%);
-  transition:transform .25s;z-index:50;box-shadow:4px 0 20px rgba(0,0,0,.15)}
-  .sidebar.open{transform:translateX(0)}
-  .main{padding:18px 16px 28px}
-  .hamburger{display:inline-flex;align-items:center;justify-content:center}
-  .topbar{align-items:center}
-  .topbar-right{width:100%;justify-content:flex-end}
-  .topbar-left h1{font-size:19px}
-  .search input{width:100%}.search{flex:1;min-width:200px}.select{flex:1;min-width:140px}
-  .heatmap .rlabel{width:90px}
-  .heatmap .clabels{padding-left:96px}
-  .fault-detail{max-width:160px}}
-@media (max-width:520px){.stat{grid-template-columns:48px 1fr;padding-bottom:24px}
-  .stat-trend{grid-column:2/3;text-align:left;margin-top:4px}
-  .stat-icon{grid-row:span 2;width:44px;height:44px}
-  .stat-value{font-size:24px}
-  .pred-cards{grid-template-columns:1fr}}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text)}
+body{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;font-size:14px;letter-spacing:0}button,input,select{font:inherit}button{cursor:pointer}
+.app{min-height:100vh;display:grid;grid-template-columns:260px minmax(0,1fr)}
+.side{background:#111827;color:#d8dee9;padding:18px 14px;display:flex;flex-direction:column;gap:18px;position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:center;gap:12px;padding:6px 8px 16px;border-bottom:1px solid rgba(255,255,255,.08)}
+.logo{width:42px;height:42px;border-radius:8px;background:#f8fafc;color:#111827;display:grid;place-items:center;flex:none}.logo svg{width:28px;height:28px}
+.brand b{display:block;color:#fff;font-size:16px}.brand span{display:block;color:#9ca3af;font-size:12px;margin-top:2px}
+.nav{display:flex;flex-direction:column;gap:4px}.nav button{border:0;background:transparent;color:#cbd5e1;text-align:left;border-radius:8px;padding:10px 12px;display:flex;gap:10px;align-items:center}.nav button:hover{background:rgba(255,255,255,.06)}.nav button.active{background:#2563eb;color:#fff}
+.side-meta{margin-top:auto;border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:12px;background:rgba(255,255,255,.04)}.side-meta .k{font-size:11px;color:#9ca3af;text-transform:uppercase}.side-meta .v{margin-top:4px;color:#fff;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.main{min-width:0;padding:24px 28px 34px}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:18px}.title h1{margin:0;font-size:25px;line-height:1.15;color:var(--ink)}.title p{margin:6px 0 0;color:var(--muted)}
+.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}.field{display:flex;align-items:center;gap:6px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:7px 10px}.field span{font-size:12px;color:var(--muted);white-space:nowrap}.field input,.field select{border:0;background:transparent;color:var(--text);outline:0;min-width:116px}.btn{border:1px solid var(--line);background:#fff;border-radius:8px;padding:8px 12px;color:var(--text);font-weight:650}.btn.primary{background:var(--blue);border-color:var(--blue);color:#fff}.btn:hover{filter:brightness(.98)}
+.runtime{display:grid;grid-template-columns:minmax(0,1.2fr) repeat(3,minmax(150px,.35fr));gap:10px;margin-bottom:16px}.runtime-item{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;box-shadow:var(--shadow);min-width:0}.runtime-item .k{color:var(--muted);font-size:11px;text-transform:uppercase}.runtime-item .v{margin-top:5px;font-weight:750;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.runtime-item.warn{border-color:#f6d58b;background:#fffaf0}.runtime-item.good{border-color:#b7ebc6;background:#f3fff6}
+.grid-heads{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:16px}.head-card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;box-shadow:var(--shadow);min-width:0}.head-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.head-no{font-size:12px;color:var(--muted);font-weight:700}.head-card h3{margin:3px 0 0;font-size:16px}.head-metric{margin-top:12px;color:var(--muted);font-size:12px}.head-value{font-size:28px;line-height:1.1;font-weight:800;margin-top:8px;color:var(--ink);overflow-wrap:anywhere}.pill{display:inline-flex;align-items:center;border-radius:999px;padding:4px 9px;font-size:12px;font-weight:750}.pill.blue{background:var(--blue-soft);color:#1d4ed8}.pill.green{background:var(--green-soft);color:#15803d}.pill.amber{background:var(--amber-soft);color:#92400e}.pill.red{background:var(--red-soft);color:#991b1b}.pill.gray{background:#eef2f7;color:#475569}
+.panel-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(320px,.75fr);gap:16px;margin-bottom:16px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);padding:16px;min-width:0}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}.panel-head h2{font-size:16px;margin:0;color:var(--ink)}.chart{position:relative;height:260px;min-width:0}.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;min-width:0}.split>*{min-width:0}.mini-stat{background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:12px}.mini-stat .k{font-size:12px;color:var(--muted)}.mini-stat .v{margin-top:5px;font-size:19px;font-weight:800;color:var(--ink)}
+.table-tools{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;flex-wrap:wrap}.search{background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-width:260px}.search input{border:0;outline:0;width:100%;background:transparent}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:8px}table{width:100%;border-collapse:collapse;background:#fff}th,td{padding:12px 13px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{font-size:12px;color:var(--muted);background:#f8fafc;white-space:nowrap}td{font-size:13px}tr:last-child td{border-bottom:0}.robot{font-weight:780;color:var(--ink)}.muted{color:var(--muted)}.bar{height:8px;background:#e5e7eb;border-radius:99px;overflow:hidden;min-width:90px}.bar i{display:block;height:100%;background:var(--blue);border-radius:99px}.status{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:4px 9px;font-size:12px;font-weight:750}.status:before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.status.Critical{background:var(--red-soft);color:#991b1b}.status.Warning{background:var(--amber-soft);color:#92400e}.status.Normal{background:var(--green-soft);color:#166534}.status.Unknown{background:#eef2f7;color:#475569}
+.pager{display:flex;gap:6px;justify-content:flex-end;align-items:center;margin-top:12px}.pager button{border:1px solid var(--line);background:#fff;border-radius:6px;min-width:32px;height:32px}.pager button.active{background:var(--blue);border-color:var(--blue);color:#fff}.pager button:disabled{opacity:.45;cursor:not-allowed}.page{display:none}.page.active{display:block}.empty{padding:26px;text-align:center;color:var(--muted)}.metric-table td:first-child{font-weight:750}.metric-table td{white-space:normal}.code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}.hamb{display:none}
+@media(max-width:1180px){.grid-heads{grid-template-columns:repeat(2,minmax(0,1fr))}.runtime{grid-template-columns:1fr 1fr}.panel-grid{grid-template-columns:1fr}}
+@media(max-width:780px){.app{grid-template-columns:1fr}.side{position:fixed;z-index:20;left:0;top:0;transform:translateX(-100%);transition:.2s;width:260px}.side.open{transform:translateX(0)}.main{padding:18px}.hamb{display:inline-flex}.top{flex-direction:column}.controls{justify-content:flex-start}.grid-heads,.runtime,.split{grid-template-columns:1fr}.field{width:100%}.field input,.field select{flex:1}.search{min-width:100%}}
 </style>
 </head>
 <body>
 <div class="app">
-  <aside class="sidebar" id="sidebar">
-    <div class="sidebar-top">
-      <div class="brand">
-        <div class="brand-logo">
-          <svg viewBox="0 0 32 32" width="32" height="32" fill="none" stroke="currentColor"
-               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="6" y="10" width="20" height="14" rx="3" />
-            <circle cx="12" cy="17" r="1.5" fill="currentColor" />
-            <circle cx="20" cy="17" r="1.5" fill="currentColor" />
-            <path d="M16 10V6" /><circle cx="16" cy="5" r="1.5" />
-          </svg>
-        </div>
-        <div>
-          <div class="brand-title">RoboClean</div>
-          <div class="brand-sub">Predictive Maintenance</div>
-        </div>
-      </div>
-      <nav class="nav" id="mainNav">
-        <button class="nav-item active" data-page="dashboard"><span class="nav-icon">⌂</span><span class="nav-label">Dashboard</span></button>
-        <button class="nav-item" data-page="monitoring"><span class="nav-icon">⚙</span><span class="nav-label">Robot Monitoring</span><span class="nav-arrow">›</span></button>
-        <button class="nav-item" data-page="predictions"><span class="nav-icon">▣</span><span class="nav-label">Predictions &amp; Analysis</span><span class="nav-arrow">›</span></button>
-        <button class="nav-item" data-page="fault-history"><span class="nav-icon">⏲</span><span class="nav-label">Fault History</span><span class="nav-arrow">›</span></button>
-        <button class="nav-item" data-page="maintenance"><span class="nav-icon">▤</span><span class="nav-label">Maintenance Logs</span></button>
-        <button class="nav-item" data-page="model"><span class="nav-icon">◈</span><span class="nav-label">Model Performance</span></button>
-        <button class="nav-item" data-page="settings"><span class="nav-icon">⚙</span><span class="nav-label">Settings</span></button>
-      </nav>
+  <aside class="side" id="side">
+    <div class="brand">
+      <div class="logo" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="11" width="20" height="13" rx="3"/><path d="M11 11V8a5 5 0 0 1 10 0v3"/><circle cx="12" cy="17" r="1.4" fill="currentColor"/><circle cx="20" cy="17" r="1.4" fill="currentColor"/><path d="M11 25h10"/></svg></div>
+      <div><b>PUDU Ops</b><span>LSTM V2 Heads</span></div>
     </div>
-    <div class="sidebar-bottom">
-      <div class="status-card">
-        <span class="status-dot"></span>
-        <div><div class="status-title">System Status</div><div class="status-sub">All Systems Operational</div></div>
-      </div>
-      <div class="user-card">
-        <div class="user-avatar">AE</div>
-        <div class="user-meta"><div class="user-name">Admin User</div><div class="user-mail">admin@roboclean.com</div></div>
-        <span class="user-caret">▾</span>
-      </div>
-    </div>
+    <nav class="nav" id="nav">
+      <button class="active" data-page="dashboard">Head Dashboard</button>
+      <button data-page="robots">Robot Outputs</button>
+      <button data-page="history">Fault History</button>
+      <button data-page="model">Model Runtime</button>
+    </nav>
+    <div class="side-meta"><div class="k">Runtime source</div><div class="v" id="sideSource">Loading</div></div>
   </aside>
 
   <main class="main">
+    <div class="top">
+      <div class="title">
+        <button class="btn hamb" onclick="toggleSide()">Menu</button>
+        <h1>Predictive Maintenance Dashboard</h1>
+        <p id="subtitle">GitHub model contract + Hugging Face operation logs</p>
+      </div>
+      <div class="controls">
+        <label class="field"><span>Start</span><input type="date" id="startDate"></label>
+        <label class="field"><span>Reference</span><input type="date" id="endDate"></label>
+        <label class="field"><span>Horizon</span><select id="horizon"><option value="7">7 gün</option></select></label>
+        <button class="btn" onclick="resetDates()">Reset</button>
+        <button class="btn primary" onclick="reloadActive()">Apply</button>
+      </div>
+    </div>
+
+    <section class="runtime" id="runtimeStrip"></section>
 
     <section class="page active" id="page-dashboard">
-      <header class="topbar">
-        <button class="hamburger" onclick="toggleSidebar()" aria-label="Open menu">☰</button>
-        <div class="topbar-left">
-          <h1>Dashboard</h1>
-          <p>Real-time overview of your autonomous cleaning robots</p>
-        </div>
-        <div class="topbar-right">
-          <button class="bell" id="bellBtn" aria-label="Notifications" onclick="toggleNotifPanel(event)"><span>🔔</span><span class="bell-badge" id="bellBadge">0</span></button>
-          <button class="date-picker" id="dateRange" onclick="toggleDatePicker(event,'dateRange')">Date range ▾</button>
-        </div>
-      </header>
-      <section class="cards">
-        <div class="card stat">
-          <div class="stat-icon icon-blue"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="11" rx="2"></rect><path d="M8 8V6a4 4 0 0 1 8 0v2"></path><circle cx="9" cy="13" r="1"></circle><circle cx="15" cy="13" r="1"></circle></svg></div>
-          <div class="stat-body">
-            <div class="stat-title">Active Robots</div>
-            <div class="stat-value" id="activeRobotsValue">—</div>
-            <div class="stat-sub" id="activeRobotsSub">of — total robots</div>
+      <div class="grid-heads" id="headCards"></div>
+      <div class="panel-grid">
+        <section class="panel">
+          <div class="panel-head"><h2>7 Günlük Öngörü Penceresi</h2><span class="pill gray" id="coveragePill">—</span></div>
+          <div class="chart"><canvas id="timelineChart"></canvas></div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><h2>Şiddet ve Bileşen Dağılımı</h2><span class="pill blue" id="robotCountPill">—</span></div>
+          <div class="split">
+            <div class="chart"><canvas id="severityChart"></canvas></div>
+            <div id="componentStats"></div>
           </div>
-          <div class="stat-trend" id="activeRobotsTrend"></div>
-          <div class="stat-bar"><div class="stat-bar-fill blue" id="activeRobotsBar" style="width:0%"></div></div>
-        </div>
-        <div class="card stat">
-          <div class="stat-icon icon-red"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 L22 20 L2 20 Z"></path><path d="M12 9v5"></path><circle cx="12" cy="17" r="1" fill="currentColor"></circle></svg></div>
-          <div class="stat-body">
-            <div class="stat-title">Critical Fault Alerts</div>
-            <div class="stat-value" id="criticalValue">—</div>
-            <div class="stat-sub">robots require attention</div>
-          </div>
-          <div class="stat-trend" id="criticalTrend"></div>
-          <div class="stat-bar"><div class="stat-bar-fill red" id="criticalBar" style="width:0%"></div></div>
-        </div>
-        <div class="card stat">
-          <div class="stat-icon icon-green"><svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg></div>
-          <div class="stat-body">
-            <div class="stat-title">Overall Fleet Health</div>
-            <div class="stat-value" id="fleetValue">—%</div>
-            <div class="stat-sub">healthy robots</div>
-          </div>
-          <div class="stat-trend" id="fleetTrend"></div>
-          <div class="stat-bar"><div class="stat-bar-fill green" id="fleetBar" style="width:0%"></div></div>
-        </div>
-      </section>
-
-      <section class="charts">
-        <div class="card chart-card">
-          <div class="chart-head">
-            <h3>Sensor Anomaly Trend <span class="info" title="Mean anomaly ratio (%) per time bucket">ⓘ</span></h3>
-            <select class="select" id="anomalyRobotSelect"><option value="">All Robots</option></select>
-          </div>
-          <div class="chart-body"><canvas id="anomalyChart"></canvas></div>
-        </div>
-        <div class="card chart-card">
-          <div class="chart-head"><h3>Fault Distribution <span class="info" title="Top 5 error_type categories">ⓘ</span></h3></div>
-          <div class="chart-body donut-wrap">
-            <canvas id="faultChart"></canvas>
-            <ul class="legend" id="faultLegend"></ul>
-          </div>
-        </div>
-      </section>
-
-      <section class="card table-card">
-        <div class="table-head">
-          <h3>Robot Health Overview</h3>
-          <div class="table-controls">
-            <div class="search"><span class="search-icon">🔎</span><input type="search" id="robotSearch" placeholder="Search robot ID..." /></div>
-            <select class="select" id="statusFilter"></select>
-            <select class="select" id="faultFilter"></select>
-          </div>
-        </div>
-        <div class="table-wrap">
-          <table class="data">
-            <thead><tr><th>Robot ID</th><th>Status</th><th>Predicted Fault</th><th>Semantic Score</th><th>Last Updated ↕</th><th class="action-col">Action</th></tr></thead>
-            <tbody id="robotTableBody"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
-          </table>
-        </div>
-        <div class="table-foot">
-          <div class="pagination-info" id="paginationInfo">Showing 0 of 0 robots</div>
-          <nav class="pagination" id="pagination"></nav>
-        </div>
-      </section>
-    </section>
-
-    <section class="page" id="page-fault-history">
-      <header class="topbar">
-        <button class="hamburger" onclick="toggleSidebar()" aria-label="Open menu">☰</button>
-        <div class="topbar-left">
-          <h1>Fault History</h1>
-          <p>Browse and analyze historical faults and system issues</p>
-        </div>
-        <div class="topbar-right">
-          <button class="bell" aria-label="Notifications" onclick="toggleNotifPanel(event)"><span>🔔</span><span class="bell-badge" id="bellBadge2">0</span></button>
-          <button class="date-picker" id="fhDateRange" onclick="toggleDatePicker(event,'fhDateRange')">Date range ▾</button>
-        </div>
-      </header>
-
-      <div class="card" style="margin-bottom:18px">
-        <div class="chart-head">
-          <h3>Fault Frequency Over Time (Last 6 Months) <span class="info" title="Monthly fault counts grouped by component category">ⓘ</span></h3>
-        </div>
-        <div style="display:grid;grid-template-columns:1fr auto;gap:20px;align-items:center">
-          <div class="bar-chart-wrap"><canvas id="freqChart"></canvas></div>
-          <ul class="cat-legend">
-            <li><span class="dot" style="background:var(--cat-brush)"></span>Brush Motor Issues</li>
-            <li><span class="dot" style="background:var(--cat-battery)"></span>Battery &amp; Power</li>
-            <li><span class="dot" style="background:var(--cat-nav)"></span>Navigation System</li>
-            <li><span class="dot" style="background:var(--cat-vacuum)"></span>Vacuum System</li>
-            <li><span class="dot" style="background:var(--cat-other)"></span>Other</li>
-          </ul>
-        </div>
+        </section>
       </div>
-
-      <div class="filter-row">
-        <div class="search" style="flex:1;min-width:180px">
-          <span class="search-icon">🔎</span>
-          <input type="search" id="fhSearch" placeholder="Search faults..." />
-        </div>
-        <select class="select" id="fhRobotFilter"></select>
-        <select class="select" id="fhFaultFilter"></select>
-        <select class="select" id="fhStatusFilter"></select>
-        <input class="input-date" type="date" id="fhStartDate" />
-        <span class="arrow">→</span>
-        <input class="input-date" type="date" id="fhEndDate" />
-        <button class="btn-ghost" onclick="clearFhFilters()">↻ Clear Filters</button>
-      </div>
-
-      <section class="card table-card">
-        <div class="table-wrap">
-          <table class="data">
-            <thead><tr>
-              <th>Date &amp; Time</th><th>Robot ID</th><th>Fault Type</th>
-              <th>Diagnosed Issue (From Logs)</th><th>Downtime Duration</th>
-              <th>Resolution Status</th><th class="action-col">Actions</th>
-            </tr></thead>
-            <tbody id="fhTableBody"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
-          </table>
-        </div>
-        <div class="table-foot">
-          <div class="pagination-info" id="fhPaginationInfo">Showing 0 of 0 faults</div>
-          <nav class="pagination" id="fhPagination"></nav>
-        </div>
+      <section class="panel">
+        <div class="panel-head"><h2>Öncelikli Robotlar</h2><button class="btn" onclick="navigate('robots')">Tümünü Aç</button></div>
+        <div class="table-wrap"><table><thead><tr><th>Robot</th><th>Anlık</th><th>Şiddet</th><th>7 Gün</th><th>Tahmini Süre</th><th>Son Log</th></tr></thead><tbody id="priorityRows"><tr><td colspan="6" class="empty">Loading</td></tr></tbody></table></div>
       </section>
     </section>
 
-    <section class="page" id="page-predictions">
-      <header class="topbar">
-        <button class="hamburger" onclick="toggleSidebar()" aria-label="Open menu">☰</button>
-        <div class="topbar-left">
-          <h1>Predictions &amp; Analysis</h1>
-          <p>AI-powered insights and predictive analytics for your robot fleet</p>
+    <section class="page" id="page-robots">
+      <section class="panel">
+        <div class="table-tools">
+          <div class="search"><input id="robotSearch" placeholder="Robot ID filtrele"></div>
+          <div class="muted" id="robotPageInfo">—</div>
         </div>
-        <div class="topbar-right">
-          <button class="bell" aria-label="Notifications" onclick="toggleNotifPanel(event)"><span>🔔</span><span class="bell-badge" id="bellBadge3">0</span></button>
-          <button class="date-picker" id="predDateRange" onclick="toggleDatePicker(event,'predDateRange')">Date range ▾</button>
-        </div>
-      </header>
-
-      <div class="filter-row">
-        <select class="select" id="predRobotFilter"></select>
-        <select class="select" id="predCategoryFilter"></select>
-        <select class="select" id="predWindowFilter">
-          <option value="7">Last 7 Days</option>
-          <option value="30">Last 30 Days</option>
-          <option value="90">Last 90 Days</option>
-        </select>
-      </div>
-
-      <div class="preds-row">
-        <div class="card heat-card">
-          <div class="chart-head">
-            <h3>Fleet Risk Assessment Heatmap <span class="info" title="Per-robot average risk per week (red = high risk)">ⓘ</span></h3>
-          </div>
-          <div style="display:flex;gap:12px;align-items:flex-end">
-            <div class="heatmap" id="heatmapGrid" style="flex:1"></div>
-            <div class="heat-legend"><div>High</div><div class="bar"></div><div>Low</div></div>
-          </div>
-        </div>
-
-        <div class="card degr-card">
-          <div class="chart-head">
-            <h3>Component Degradation Over Time <span class="info" title="Health score over time + projected failure">ⓘ</span></h3>
-            <select class="select" id="degrCategoryFilter">
-              <option>Brush Motor Issues</option>
-              <option>Battery &amp; Power</option>
-              <option>Navigation System</option>
-              <option>Vacuum System</option>
-            </select>
-          </div>
-          <div class="degr-grid">
-            <div><h4>LSTM Model Prediction</h4>
-              <div class="mini"><span class="pred-badge" id="lstmBadge">—</span><canvas id="lstmChart"></canvas></div></div>
-            <div><h4>Random Forest Model Prediction</h4>
-              <div class="mini"><span class="pred-badge" id="rfBadge">—</span><canvas id="rfChart"></canvas></div></div>
-          </div>
-        </div>
-      </div>
-
-      <section class="cards" style="grid-template-columns:repeat(4,minmax(0,1fr))">
-        <div class="card stat">
-          <div class="stat-icon icon-green"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg></div>
-          <div class="stat-body"><div class="stat-title">Average Fleet Health</div><div class="stat-value" id="predFleet">—%</div></div>
-          <div class="stat-trend" id="predFleetTrend"></div>
-          <div class="stat-bar"><div class="stat-bar-fill green" id="predFleetBar" style="width:0%"></div></div>
-        </div>
-        <div class="card stat">
-          <div class="stat-icon icon-red"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 L22 20 L2 20 Z"></path><path d="M12 9v5"></path><circle cx="12" cy="17" r="1" fill="currentColor"></circle></svg></div>
-          <div class="stat-body"><div class="stat-title">High Risk Robots</div><div class="stat-value" id="predHighRisk">—</div></div>
-          <div class="stat-trend" id="predHighRiskTrend"></div>
-          <div class="stat-bar"><div class="stat-bar-fill red" id="predHighRiskBar" style="width:0%"></div></div>
-        </div>
-        <div class="card stat">
-          <div class="stat-icon icon-blue"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v6l4 2"></path></svg></div>
-          <div class="stat-body"><div class="stat-title">Predicted Failures (48h)</div><div class="stat-value" id="predFail">—</div></div>
-          <div class="stat-trend" id="predFailTrend"></div>
-          <div class="stat-bar"><div class="stat-bar-fill blue" id="predFailBar" style="width:0%"></div></div>
-        </div>
-        <div class="card stat">
-          <div class="stat-icon icon-purple"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M8 12l2.5 2.5L16 9"></path></svg></div>
-          <div class="stat-body"><div class="stat-title">Model Accuracy</div><div class="stat-value" id="predAcc">—%</div></div>
-          <div class="stat-trend" id="predAccTrend"></div>
-          <div class="stat-bar"><div class="stat-bar-fill purple" id="predAccBar" style="width:0%"></div></div>
-        </div>
-      </section>
-
-      <section class="card">
-        <div class="chart-head">
-          <h3>Top Failure Predictions (Next 48 Hours) <span class="info" title="Robots with highest predicted failure probability">ⓘ</span></h3>
-        </div>
-        <div class="pred-cards" id="predCardsContainer"><div class="empty">Loading…</div></div>
+        <div class="table-wrap"><table><thead><tr><th>Robot</th><th>Component</th><th>Head 1</th><th>Head 2</th><th>Head 3</th><th>Head 4</th><th>Evidence</th></tr></thead><tbody id="robotRows"><tr><td colspan="7" class="empty">Loading</td></tr></tbody></table></div>
+        <div class="pager" id="robotPager"></div>
       </section>
     </section>
 
-    <section class="page" id="page-monitoring">
-      <header class="topbar"><button class="hamburger" onclick="toggleSidebar()">☰</button>
-        <div class="topbar-left"><h1>Robot Monitoring</h1><p>Coming soon</p></div></header>
-      <div class="card empty">Robot monitoring view will live here.</div>
+    <section class="page" id="page-history">
+      <div class="panel-grid">
+        <section class="panel"><div class="panel-head"><h2>Fault Frequency</h2></div><div class="chart"><canvas id="faultChart"></canvas></div></section>
+        <section class="panel"><div class="panel-head"><h2>Historical Logs</h2></div><div class="search" style="margin-bottom:12px"><input id="faultSearch" placeholder="Fault / robot ara"></div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Robot</th><th>Component</th><th>Issue</th><th>Resolution</th></tr></thead><tbody id="faultRows"><tr><td colspan="5" class="empty">Loading</td></tr></tbody></table></div></section>
+      </div>
     </section>
-    <section class="page" id="page-maintenance">
-      <header class="topbar"><button class="hamburger" onclick="toggleSidebar()">☰</button>
-        <div class="topbar-left"><h1>Maintenance Logs</h1><p>Coming soon</p></div></header>
-      <div class="card empty">Maintenance logs view will live here.</div>
-    </section>
+
     <section class="page" id="page-model">
-      <header class="topbar"><button class="hamburger" onclick="toggleSidebar()">☰</button>
-        <div class="topbar-left"><h1>Model Performance</h1><p>LSTM partitioned model metrics</p></div></header>
-      <div class="card" id="modelInfoCard">Loading…</div>
+      <section class="panel"><div class="panel-head"><h2>Model Runtime</h2><span class="pill gray" id="modelStatus">—</span></div><div id="modelRuntimeBody" class="empty">Loading</div></section>
     </section>
-    <section class="page" id="page-settings">
-      <header class="topbar"><button class="hamburger" onclick="toggleSidebar()">☰</button>
-        <div class="topbar-left"><h1>Settings</h1><p>Coming soon</p></div></header>
-      <div class="card empty">Settings view will live here.</div>
-    </section>
-
   </main>
 </div>
 
-<div class="modal-backdrop" id="modalBackdrop" hidden>
-  <div class="modal" role="dialog" aria-modal="true">
-    <div class="modal-head">
-      <h2 id="modalTitle">Robot Details</h2>
-      <button class="modal-close" onclick="closeModal()">✕</button>
-    </div>
-    <div class="modal-body" id="modalBody">Loading…</div>
-  </div>
-</div>
-
-<!-- Date range popover (single global instance, repositioned per page) -->
-<div class="popover" id="datePopover" hidden onclick="event.stopPropagation()">
-  <h4>Select Date Range</h4>
-  <div class="quick">
-    <button onclick="applyQuickRange(7)">Last 7 days</button>
-    <button onclick="applyQuickRange(30)">Last 30 days</button>
-    <button onclick="applyQuickRange(90)">Last 90 days</button>
-    <button onclick="applyQuickRange('all')">All time</button>
-  </div>
-  <div class="row"><label>Start date</label><input type="date" id="rangeStartInput" /></div>
-  <div class="row"><label>End date</label><input type="date" id="rangeEndInput" /></div>
-  <div class="actions">
-    <button onclick="resetRange()">Reset</button>
-    <button class="primary" onclick="applyRange()">Apply</button>
-  </div>
-</div>
-
-<!-- Notifications panel -->
-<div class="notif-panel" id="notifPanel" hidden onclick="event.stopPropagation()">
-  <div class="notif-head">
-    <h4>Notifications</h4>
-    <button class="clear" onclick="markAllRead()">Mark all read</button>
-  </div>
-  <ul class="notif-list" id="notifList"><li class="notif-empty">Loading…</li></ul>
-</div>
-
 <script>
-const FAULT_COLORS = ["#3b82f6","#10b981","#f59e0b","#a855f7","#94a3b8"];
-const CAT_COLORS = {
-  "Brush Motor Issues":"#3b82f6","Battery & Power":"#10b981","Navigation System":"#f59e0b",
-  "Vacuum System":"#a855f7","Other":"#94a3b8",
-};
-const state = {
-  page:1, pageSize:5, search:"", status:"All Statuses", faultType:"All Fault Types",
-  fh:{page:1, pageSize:8, search:"", robot:"All Robots", fault_type:"All Fault Types", status:"All Statuses", start_date:"", end_date:""},
-  pred:{category:"Brush Motor Issues"},
-  // global date filter shared across dashboard/predictions/fault-history
-  range:{ start:"", end:"", extentStart:"", extentEnd:"" },
-  notifications:{ items:[], dismissedAt:null },
-};
-let charts = {};
+const state = { page:'dashboard', start:'', end:'', horizon:7, robotPage:1, robotSize:12, robotSearch:'', runtime:null, summary:null };
+const charts = {};
+const palette = ['#2563eb','#0f766e','#16a34a','#d97706','#dc2626','#475569','#7c3aed','#0891b2'];
 
-document.addEventListener("DOMContentLoaded", () => {
-  bindNav(); bindDashboardUI(); bindFaultHistoryUI(); bindPredictionsUI();
-  const initial = (location.hash || "#dashboard").replace("#","");
-  navigate(initial);
+document.addEventListener('DOMContentLoaded', () => {
+  bindNav(); bindControls(); navigate((location.hash || '#dashboard').slice(1) || 'dashboard', false); loadShell();
 });
-
-function bindNav(){
-  document.querySelectorAll("[data-page]").forEach(btn=>{
-    btn.addEventListener("click", ()=>navigate(btn.dataset.page));
-  });
-  window.addEventListener("hashchange", ()=>{
-    const p = (location.hash||"#dashboard").replace("#","");
-    navigate(p, false);
-  });
+function bindNav(){ document.querySelectorAll('[data-page]').forEach(btn=>btn.addEventListener('click',()=>navigate(btn.dataset.page))); window.addEventListener('hashchange',()=>navigate((location.hash||'#dashboard').slice(1), false)); }
+function bindControls(){
+  document.getElementById('horizon').addEventListener('change', e=>{state.horizon=Number(e.target.value); reloadActive();});
+  document.getElementById('startDate').addEventListener('change', e=>state.start=e.target.value);
+  document.getElementById('endDate').addEventListener('change', e=>state.end=e.target.value);
+  document.getElementById('robotSearch').addEventListener('input', debounce(e=>{state.robotSearch=e.target.value.trim(); state.robotPage=1; loadRobots();},250));
+  document.getElementById('faultSearch').addEventListener('input', debounce(()=>loadHistory(),250));
 }
-
+function toggleSide(){ document.getElementById('side').classList.toggle('open'); }
 function navigate(page, updateHash=true){
-  document.querySelectorAll(".page").forEach(s=>s.classList.remove("active"));
-  const target = document.getElementById(`page-${page}`);
-  if (!target){ navigate("dashboard"); return; }
-  target.classList.add("active");
-  document.querySelectorAll("[data-page]").forEach(b=>b.classList.toggle("active", b.dataset.page===page));
-  if (updateHash) location.hash = page;
-  document.getElementById("sidebar").classList.remove("open");
-  if (page==="dashboard")     loadDashboard();
-  if (page==="fault-history") loadFaultHistory();
-  if (page==="predictions")   loadPredictions();
-  if (page==="model")         loadModelInfo();
+  if (!document.getElementById('page-'+page)) page='dashboard'; state.page=page;
+  document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active', p.id==='page-'+page));
+  document.querySelectorAll('[data-page]').forEach(b=>b.classList.toggle('active', b.dataset.page===page));
+  document.getElementById('side').classList.remove('open'); if(updateHash) location.hash=page; reloadActive();
 }
-function toggleSidebar(){ document.getElementById("sidebar").classList.toggle("open"); }
+async function loadShell(){ await Promise.all([loadRuntime(), loadSummary()]); await Promise.all([loadTimeline(), loadRobots(true)]); }
+function reloadActive(){ if(state.page==='dashboard') loadDashboard(); if(state.page==='robots') loadRobots(); if(state.page==='history') loadHistory(); if(state.page==='model') loadModel(); }
+async function loadDashboard(){ await Promise.all([loadSummary(), loadTimeline(), loadRobots(true)]); }
+function resetDates(){ state.start=''; state.end=''; document.getElementById('startDate').value=''; document.getElementById('endDate').value=''; reloadActive(); }
+function query(extra={}){ const p=new URLSearchParams(); if(state.start) p.set('start_date',state.start); if(state.end) p.set('end_date',state.end); p.set('horizon_days', state.horizon); Object.entries(extra).forEach(([k,v])=>{if(v!==''&&v!=null)p.set(k,v)}); return p.toString(); }
 
-function bindDashboardUI(){
-  document.getElementById("robotSearch").addEventListener("input", debounce(e=>{
-    state.search = e.target.value.trim(); state.page=1; loadRobots();
-  }, 300));
-  document.getElementById("statusFilter").addEventListener("change", e=>{
-    state.status=e.target.value; state.page=1; loadRobots();
-  });
-  document.getElementById("faultFilter").addEventListener("change", e=>{
-    state.faultType=e.target.value; state.page=1; loadRobots();
-  });
-  document.getElementById("anomalyRobotSelect").addEventListener("change", e=>{
-    loadAnomalyTrend(e.target.value || null);
-  });
+async function loadRuntime(){
+  const d = await fetchJson('/api/model-runtime'); state.runtime=d; renderRuntime(d);
+}
+function renderRuntime(d){
+  const source = d.engine_available ? 'LSTM V2 inference' : 'Dataset target replay';
+  document.getElementById('sideSource').textContent = source;
+  const short = d.git_commit ? d.git_commit.slice(0,10) : 'unavailable';
+  const weightCls = d.weights_available ? 'good' : 'warn';
+  document.getElementById('runtimeStrip').innerHTML = `
+    <div class="runtime-item"><div class="k">Fresh GitHub checkout</div><div class="v" title="${esc(d.repo_url)}">${esc(d.repo_url)}</div></div>
+    <div class="runtime-item"><div class="k">Commit</div><div class="v code">${esc(short)}</div></div>
+    <div class="runtime-item ${weightCls}"><div class="k">Model artifacts</div><div class="v">${d.weights_available?'weights present':'weights missing'}</div></div>
+    <div class="runtime-item"><div class="k">Prediction source</div><div class="v">${source}</div></div>`;
 }
 
-async function loadDashboard(){
-  await Promise.all([loadStats(), loadAnomalyTrend(), loadFaultDistribution(), loadFilterOptions()]);
-  await loadRobots();
-  populateAnomalyRobotSelect();
+async function loadSummary(){
+  const d = await fetchJson('/api/model-heads/summary?'+query()); state.summary=d; renderSummary(d);
+  if(!state.start && d.range?.start) document.getElementById('startDate').value = isoDate(d.range.start);
+  if(!state.end && d.range?.end) document.getElementById('endDate').value = isoDate(d.range.end);
+}
+function renderSummary(d){
+  document.getElementById('subtitle').textContent = `${fmtDateTime(d.reference_time)} reference · ${d.source.replaceAll('_',' ')}`;
+  document.getElementById('coveragePill').textContent = d.future_window_complete ? 'full 7-day window' : 'partial window';
+  document.getElementById('coveragePill').className = 'pill ' + (d.future_window_complete ? 'green':'amber');
+  document.getElementById('robotCountPill').textContent = `${d.total_robots} robots`;
+  document.getElementById('headCards').innerHTML = d.heads.map((h,i)=>headCard(h,i)).join('');
+  renderDonut('severityChart', Object.keys(d.severity_counts||{}), Object.values(d.severity_counts||{}));
+  renderComponents(d.component_counts || {});
+}
+function headCard(h,i){
+  const metric = h.metric ? `${esc(h.metric.metric)} · ${esc(h.metric.result)}` : 'metric unavailable';
+  const value = h.unit==='distribution' ? esc(h.detail) : (h.value==null ? '—' : esc(h.detail || h.value));
+  const cls = ['blue','green','amber','red'][i] || 'gray';
+  return `<article class="head-card"><div class="head-top"><div><div class="head-no">Head ${i+1}</div><h3>${esc(h.name)}</h3></div><span class="pill ${cls}">${esc(h.unit)}</span></div><div class="head-value">${value}</div><div class="head-metric">${metric}</div></article>`;
+}
+function renderComponents(counts){
+  const entries = Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,6);
+  document.getElementById('componentStats').innerHTML = entries.map(([k,v],i)=>`<div class="mini-stat" style="margin-bottom:8px"><div class="k">${esc(k)}</div><div class="v">${v}</div><div class="bar"><i style="width:${Math.min(100,v*4)}%;background:${palette[i%palette.length]}"></i></div></div>`).join('') || '<div class="empty">No component data</div>';
+}
+async function loadTimeline(){
+  const d = await fetchJson('/api/model-heads/timeline?'+query());
+  renderBar('timelineChart', d.points.map(p=>fmtShort(p.date)), d.points.map(p=>p.robots), 'Robots');
 }
 
-async function loadStats(){
-  try{
-    const d = await fetchJson(`/api/stats${rangeQuery()}`);
-    setStatCard("active", d.active_robots, `of ${d.active_robots.total} total robots`);
-    setStatCard("critical", d.critical_alerts, "robots require attention");
-    setStatCard("fleet", d.fleet_health, "healthy robots", true);
-    if (d.range?.start && d.range?.end){
-      if (!state.range.extentStart){ state.range.extentStart = d.range.start; state.range.extentEnd = d.range.end; }
-      updateDateLabel(d.range.start, d.range.end);
-    }
-  }catch(e){ console.error(e); }
+async function loadRobots(priority=false){
+  const extra = priority ? {page:1,page_size:6} : {page:state.robotPage,page_size:state.robotSize};
+  if(state.robotSearch && !priority) extra.robot = state.robotSearch;
+  const d = await fetchJson('/api/model-heads/robots?'+query(extra));
+  if(priority){ renderPriority(d.items); return; }
+  renderRobotTable(d); renderPager('robotPager', d.page, Math.max(1,Math.ceil(d.total/d.page_size)), p=>{state.robotPage=p; loadRobots();});
+  document.getElementById('robotPageInfo').textContent = `${d.total} robots · page ${d.page}`;
+}
+function renderPriority(items){
+  const body=document.getElementById('priorityRows');
+  if(!items.length){body.innerHTML='<tr><td colspan="6" class="empty">No robots</td></tr>';return;}
+  body.innerHTML=items.map(r=>`<tr><td><div class="robot">${shortId(r.robot_id)}</div><div class="muted">${esc(r.area)}</div></td><td>${head1(r)}</td><td>${head2(r)}</td><td>${head3(r)}</td><td>${esc(r.head_4.est_time_label)}</td><td>${fmtDateTime(r.last_observed_at)}</td></tr>`).join('');
+}
+function renderRobotTable(d){
+  const body=document.getElementById('robotRows');
+  if(!d.items.length){body.innerHTML='<tr><td colspan="7" class="empty">No robots</td></tr>';return;}
+  body.innerHTML=d.items.map(r=>`<tr><td><div class="robot">${shortId(r.robot_id)}</div><div class="muted code">${esc(r.robot_id)}</div></td><td>${esc(r.component)}</td><td>${head1(r)}</td><td>${head2(r)}</td><td>${head3(r)}</td><td>${esc(r.head_4.est_time_label)}</td><td><div>${esc(r.error_type)}</div><div class="muted">${fmtDateTime(r.last_observed_at)}</div></td></tr>`).join('');
+}
+function head1(r){ const p=r.head_1.failure_prob_now ?? 0; return `<span class="status ${r.status}">${r.head_1.is_failure_now?'Failure':'Clear'}</span><div class="bar" style="margin-top:6px"><i style="width:${Math.min(100,p)}%"></i></div>`; }
+function head2(r){ return `<b>${esc(r.head_2.severity_now_tr || r.head_2.severity_now)}</b><div class="muted">score ${r.head_2.severity_score ?? '—'}</div>`; }
+function head3(r){ return r.head_3.future_failure_observed ? '<span class="pill red">future failure</span>' : '<span class="pill green">no failure</span>'; }
+
+async function loadHistory(){
+  await Promise.all([loadFaultFrequency(), loadFaultRows()]);
+}
+async function loadFaultFrequency(){
+  const d = await fetchJson('/api/fault-history/frequency?'+query());
+  const datasets = d.datasets.map((ds,i)=>({label:ds.label,data:ds.data,backgroundColor:palette[i%palette.length],borderRadius:4}));
+  renderStacked('faultChart', d.labels, datasets);
+}
+async function loadFaultRows(){
+  const p = new URLSearchParams(); p.set('page','1'); p.set('page_size','12'); if(state.start)p.set('start_date',state.start); if(state.end)p.set('end_date',state.end); const s=document.getElementById('faultSearch').value.trim(); if(s)p.set('search',s);
+  const d = await fetchJson('/api/fault-history/list?'+p.toString());
+  const body=document.getElementById('faultRows');
+  if(!d.items.length){body.innerHTML='<tr><td colspan="5" class="empty">No faults</td></tr>';return;}
+  body.innerHTML=d.items.map(x=>`<tr><td>${fmtDateTime(x.task_time)}</td><td><span class="robot">${shortId(x.robot_id)}</span></td><td>${esc(x.category)}</td><td><div>${esc(x.diagnosed_issue)}</div><div class="muted">${esc(x.fault_type_raw)}</div></td><td><span class="status ${x.resolution==='Resolved'?'Normal':'Warning'}">${esc(x.resolution)}</span></td></tr>`).join('');
+}
+async function loadModel(){
+  const d = await fetchJson('/api/model-info'); const rt=d.runtime || state.runtime || {}; document.getElementById('modelStatus').textContent = rt.status || 'unknown';
+  document.getElementById('modelRuntimeBody').innerHTML = `<div class="split"><div class="mini-stat"><div class="k">Repo path</div><div class="v code">${esc(rt.repo_path || '-')}</div></div><div class="mini-stat"><div class="k">Future window</div><div class="v">${rt.future_window_hours || '-'} h</div></div></div><h3>Head metrics</h3><div class="table-wrap"><table class="metric-table"><thead><tr><th>Head</th><th>Metric</th><th>Result</th></tr></thead><tbody>${(d.heads||[]).map(h=>`<tr><td>${esc(h.name)}</td><td>${esc(h.metric)}</td><td>${esc(h.result)}</td></tr>`).join('')}</tbody></table></div><h3>Feature columns</h3><p class="code">${esc((rt.feature_columns||[]).join(', '))}</p><h3>Runtime note</h3><p class="muted">${esc(rt.engine_error || rt.error || 'LSTM runtime prepared')}</p>`;
 }
 
-function rangeQuery(prefix="?"){
-  const parts = [];
-  if (state.range.start) parts.push("start_date=" + encodeURIComponent(state.range.start));
-  if (state.range.end)   parts.push("end_date="   + encodeURIComponent(state.range.end));
-  return parts.length ? prefix + parts.join("&") : "";
-}
-
-function rangeQueryAmp(){ return rangeQuery("&"); }
-
-function updateDateLabel(startIso, endIso){
-  const text = `${formatRange(startIso)} – ${formatRange(endIso)} ▾`;
-  ["dateRange","fhDateRange","predDateRange"].forEach(id=>{
-    const el = document.getElementById(id); if (el) el.textContent = text;
-  });
-}
-
-function setStatCard(kind, payload, subText, isPercent=false){
-  const map = {
-    active:{v:"activeRobotsValue",s:"activeRobotsSub",t:"activeRobotsTrend",b:"activeRobotsBar"},
-    critical:{v:"criticalValue",s:null,t:"criticalTrend",b:"criticalBar"},
-    fleet:{v:"fleetValue",s:null,t:"fleetTrend",b:"fleetBar"},
-  }[kind];
-  document.getElementById(map.v).textContent = isPercent ? `${payload.value}%` : payload.value;
-  if (map.s) document.getElementById(map.s).textContent = subText;
-  renderTrend(map.t, payload.delta_pct);
-  let pct = 0;
-  if (kind==="active") pct = payload.total ? (payload.value/payload.total)*100 : 0;
-  else if (kind==="fleet") pct = payload.value;
-  else pct = Math.min(100, payload.value*8);
-  document.getElementById(map.b).style.width = `${pct}%`;
-}
-
-function renderTrend(elId, delta){
-  const d = delta ?? 0;
-  const arrow = d>0 ? "↑" : d<0 ? "↓" : "→";
-  const cls = d>0 ? "badge-up" : d<0 ? "badge-down" : "badge-flat";
-  document.getElementById(elId).innerHTML =
-    `<span class="badge ${cls}">${arrow} ${Math.abs(d).toFixed(1)}%</span><span class="trend-sub">vs prev period</span>`;
-}
-
-async function loadAnomalyTrend(robotId=null){
-  try{
-    const base = robotId ? `/api/anomaly-trend?robot_id=${encodeURIComponent(robotId)}` : "/api/anomaly-trend";
-    const url = base + (base.includes("?") ? rangeQueryAmp() : rangeQuery());
-    const d = await fetchJson(url);
-    renderLine("anomalyChart", d.points.map(p=>formatShortDate(p.date)), d.points.map(p=>p.score), "#3b82f6");
-  }catch(e){ console.error(e); }
-}
-
-function renderLine(canvasId, labels, data, color){
-  const ctx = document.getElementById(canvasId).getContext("2d");
-  const grad = ctx.createLinearGradient(0,0,0,260);
-  grad.addColorStop(0, color+"4d"); grad.addColorStop(1, color+"00");
-  charts[canvasId]?.destroy();
-  charts[canvasId] = new Chart(ctx,{
-    type:"line",
-    data:{labels, datasets:[{ data, borderColor:color, backgroundColor:grad,
-      fill:true, tension:0.35, borderWidth:2, pointRadius:2, pointBackgroundColor:color }]},
-    options:{ responsive:true, maintainAspectRatio:false,
-      plugins:{legend:{display:false}, tooltip:{backgroundColor:"#1f2937", padding:10}},
-      scales:{ x:{grid:{display:false},ticks:{color:"#94a3b8"}},
-               y:{beginAtZero:true,max:100,grid:{color:"#eef2f7"},ticks:{color:"#94a3b8"}} } }
-  });
-}
-
-async function loadFaultDistribution(){
-  try{ const d = await fetchJson(`/api/fault-distribution${rangeQuery()}`); renderFaultDonut(d); }
-  catch(e){ console.error(e); }
-}
-
-function renderFaultDonut({items, total}){
-  const ctx = document.getElementById("faultChart").getContext("2d");
-  const labels = items.map(x=>x.label);
-  const values = items.map(x=>x.count);
-  const colors = items.map((_,i)=>FAULT_COLORS[i % FAULT_COLORS.length]);
-  charts.faultChart?.destroy();
-  charts.faultChart = new Chart(ctx, {
-    type:"doughnut",
-    data:{labels, datasets:[{data:values, backgroundColor:colors, borderWidth:0}]},
-    options:{responsive:true, maintainAspectRatio:false, cutout:"70%",
-      plugins:{legend:{display:false}, tooltip:{callbacks:{label:c=>`${c.label}: ${c.parsed}`}}} },
-    plugins:[{id:"center", beforeDraw(chart){
-      const {ctx, chartArea:{left,right,top,bottom}} = chart;
-      const cx=(left+right)/2, cy=(top+bottom)/2;
-      ctx.save(); ctx.fillStyle="#0f172a"; ctx.font="700 22px Inter, sans-serif";
-      ctx.textAlign="center"; ctx.textBaseline="middle";
-      ctx.fillText(total.toLocaleString(), cx, cy-8);
-      ctx.fillStyle="#94a3b8"; ctx.font="500 11px Inter, sans-serif";
-      ctx.fillText("Total Faults", cx, cy+12);
-      ctx.restore();
-    }}],
-  });
-  document.getElementById("faultLegend").innerHTML = items.map((it,i)=>`
-    <li><span><span class="dot" style="background:${colors[i]}"></span>${escapeHtml(it.label)}</span>
-      <span><span class="value">${it.count}</span> <span class="pct">(${it.pct}%)</span></span></li>`).join("");
-}
-
-async function loadFilterOptions(){
-  try{
-    const d = await fetchJson("/api/filter-options");
-    document.getElementById("statusFilter").innerHTML = d.statuses.map(s=>`<option>${s}</option>`).join("");
-    document.getElementById("faultFilter").innerHTML = d.fault_types.map(s=>`<option>${s}</option>`).join("");
-    document.getElementById("fhRobotFilter").innerHTML = d.robots.map(s=>`<option>${s}</option>`).join("");
-    document.getElementById("fhFaultFilter").innerHTML = d.fault_types.map(s=>`<option>${s}</option>`).join("");
-    document.getElementById("fhStatusFilter").innerHTML = d.statuses.map(s=>`<option>${s}</option>`).join("");
-    document.getElementById("predRobotFilter").innerHTML = d.robots.map(s=>`<option>${s}</option>`).join("");
-    document.getElementById("predCategoryFilter").innerHTML = d.categories.map(s=>`<option>${s}</option>`).join("");
-  }catch(e){ console.error(e); }
-}
-
-async function loadRobots(){
-  const params = new URLSearchParams({page:state.page, page_size:state.pageSize});
-  if (state.search) params.set("search", state.search);
-  if (state.status && state.status!=="All Statuses") params.set("status", state.status);
-  if (state.faultType && state.faultType!=="All Fault Types") params.set("fault_type", state.faultType);
-  if (state.range.start) params.set("start_date", state.range.start);
-  if (state.range.end)   params.set("end_date", state.range.end);
-  try{
-    const d = await fetchJson(`/api/robots?${params}`);
-    renderRobotTable(d);
-    renderPagination("pagination","paginationInfo", d, p=>{state.page=p; loadRobots();}, "robots");
-  }catch(e){
-    document.getElementById("robotTableBody").innerHTML =
-      `<tr><td colspan="6" class="empty">Failed to load: ${escapeHtml(String(e))}</td></tr>`;
-  }
-}
-
-function renderRobotTable({items}){
-  const body = document.getElementById("robotTableBody");
-  if (!items.length){ body.innerHTML = `<tr><td colspan="6" class="empty">No robots found</td></tr>`; return; }
-  body.innerHTML = items.map(r=>{
-    const conf = Math.round(r.confidence ?? 0);
-    let cc = "green"; if (conf>=60) cc="red"; else if (conf>=30) cc="amber";
-    return `
-      <tr>
-        <td>
-          <div class="robot-id-cell">
-            <div class="robot-thumb">${robotSvg()}</div>
-            <div>
-              <div class="robot-id">${escapeHtml(shortenId(r.robot_id))}</div>
-              <div class="robot-area">${escapeHtml(r.area || "")}</div>
-            </div>
-          </div>
-        </td>
-        <td><span class="status ${r.status.toLowerCase()}">${r.status}</span></td>
-        <td>
-          <div class="fault-name">${escapeHtml(r.predicted_fault)}</div>
-          <div class="fault-detail">${escapeHtml(r.predicted_detail || "")}</div>
-        </td>
-        <td>
-          <div class="confidence">
-            <span class="confidence-num">${conf}%</span>
-            <div class="confidence-bar"><div class="confidence-fill ${cc}" style="width:${conf}%"></div></div>
-          </div>
-        </td>
-        <td>${formatLong(r.last_updated)}</td>
-        <td class="action-col">
-          <button class="btn-secondary" onclick="openRobotModal('${escapeAttr(r.robot_id)}')">View Details</button>
-          <button class="kebab" title="More">⋮</button>
-        </td>
-      </tr>`;
-  }).join("");
-}
-
-async function populateAnomalyRobotSelect(){
-  try{
-    const d = await fetchJson("/api/robots?page=1&page_size=30");
-    const ids = [...new Set(d.items.map(r=>r.robot_id))].slice(0,30);
-    document.getElementById("anomalyRobotSelect").innerHTML =
-      `<option value="">All Robots</option>` +
-      ids.map(id=>`<option value="${escapeAttr(id)}">${escapeHtml(shortenId(id))}</option>`).join("");
-  }catch{}
-}
-
-function bindFaultHistoryUI(){
-  document.getElementById("fhSearch").addEventListener("input", debounce(e=>{
-    state.fh.search = e.target.value.trim(); state.fh.page=1; loadFhList();
-  }, 300));
-  ["fhRobotFilter","fhFaultFilter","fhStatusFilter"].forEach((id,i)=>{
-    document.getElementById(id).addEventListener("change", e=>{
-      const key = ["robot","fault_type","status"][i];
-      state.fh[key] = e.target.value; state.fh.page=1; loadFhList();
-    });
-  });
-  document.getElementById("fhStartDate").addEventListener("change", e=>{
-    state.fh.start_date=e.target.value; state.fh.page=1; loadFhList();
-  });
-  document.getElementById("fhEndDate").addEventListener("change", e=>{
-    state.fh.end_date=e.target.value; state.fh.page=1; loadFhList();
-  });
-}
-
-function clearFhFilters(){
-  state.fh = {page:1, pageSize:8, search:"", robot:"All Robots", fault_type:"All Fault Types", status:"All Statuses", start_date:"", end_date:""};
-  document.getElementById("fhSearch").value="";
-  document.getElementById("fhRobotFilter").value="All Robots";
-  document.getElementById("fhFaultFilter").value="All Fault Types";
-  document.getElementById("fhStatusFilter").value="All Statuses";
-  document.getElementById("fhStartDate").value="";
-  document.getElementById("fhEndDate").value="";
-  loadFhList();
-}
-
-async function loadFaultHistory(){
-  await Promise.all([loadFhFrequency(), loadFhList()]);
-}
-
-async function loadFhFrequency(){
-  try{
-    const d = await fetchJson(`/api/fault-history/frequency${rangeQuery()}`);
-    const datasets = d.datasets.map(ds=>({label:ds.label, data:ds.data,
-      backgroundColor: CAT_COLORS[ds.label] || "#94a3b8", borderRadius:4}));
-    const ctx = document.getElementById("freqChart").getContext("2d");
-    charts.freqChart?.destroy();
-    charts.freqChart = new Chart(ctx, {
-      type:"bar", data:{labels:d.labels, datasets},
-      options:{ responsive:true, maintainAspectRatio:false,
-        plugins:{legend:{display:false}},
-        scales:{ x:{stacked:true, grid:{display:false}, ticks:{color:"#94a3b8"}},
-                 y:{stacked:true, grid:{color:"#eef2f7"}, ticks:{color:"#94a3b8"}} } }
-    });
-  }catch(e){ console.error(e); }
-}
-
-async function loadFhList(){
-  const p = new URLSearchParams({page:state.fh.page, page_size:state.fh.pageSize});
-  if (state.fh.search) p.set("search", state.fh.search);
-  if (state.fh.robot && state.fh.robot!=="All Robots") p.set("robot", state.fh.robot);
-  if (state.fh.fault_type && state.fh.fault_type!=="All Fault Types") p.set("fault_type", state.fh.fault_type);
-  if (state.fh.status && state.fh.status!=="All Statuses") p.set("status", state.fh.status);
-  if (state.fh.start_date) p.set("start_date", state.fh.start_date);
-  if (state.fh.end_date) p.set("end_date", state.fh.end_date);
-  try{
-    const d = await fetchJson(`/api/fault-history/list?${p}`);
-    renderFhTable(d);
-    renderPagination("fhPagination","fhPaginationInfo", d, x=>{state.fh.page=x; loadFhList();}, "faults");
-  }catch(e){
-    document.getElementById("fhTableBody").innerHTML =
-      `<tr><td colspan="7" class="empty">Failed to load: ${escapeHtml(String(e))}</td></tr>`;
-  }
-}
-
-function renderFhTable({items}){
-  const body = document.getElementById("fhTableBody");
-  if (!items.length){ body.innerHTML = `<tr><td colspan="7" class="empty">No faults match the filters</td></tr>`; return; }
-  body.innerHTML = items.map(it=>{
-    const catColor = CAT_COLORS[it.category] || "#94a3b8";
-    const resCls = it.resolution==="Resolved" ? "resolved" : "in-progress";
-    return `
-      <tr>
-        <td><div style="font-weight:600">${formatDate(it.task_time)}</div>
-            <div style="font-size:11.5px;color:var(--text-mute)">${formatTimeOnly(it.task_time)}</div></td>
-        <td><div class="robot-id-cell"><div class="robot-thumb">${robotSvg()}</div>
-              <div class="robot-id">${escapeHtml(shortenId(it.robot_id))}</div></div></td>
-        <td><span class="cat-dot" style="background:${catColor}"></span>${escapeHtml(it.category)}</td>
-        <td><div class="fault-name">${escapeHtml(it.diagnosed_issue)}</div>
-            <div class="fault-detail">${escapeHtml(it.fault_type_raw)}</div></td>
-        <td>${escapeHtml(it.downtime)}</td>
-        <td><span class="status ${resCls}">${it.resolution}</span></td>
-        <td class="action-col">
-          <button class="icon-btn" title="View" onclick="openRobotModal('${escapeAttr(it.robot_id)}')">👁</button>
-          <button class="icon-btn" title="Download">⬇</button>
-        </td>
-      </tr>`;
-  }).join("");
-}
-
-function bindPredictionsUI(){
-  document.getElementById("degrCategoryFilter").addEventListener("change", e=>{
-    state.pred.category = e.target.value; loadDegradation();
-  });
-}
-
-async function loadPredictions(){
-  await Promise.all([loadHeatmap(), loadDegradation(), loadPredStats(), loadTopFailures()]);
-}
-
-async function loadHeatmap(){
-  try{
-    const d = await fetchJson("/api/predictions/heatmap");
-    const grid = document.getElementById("heatmapGrid");
-    if (!d.robot_ids.length){ grid.innerHTML = `<div class="empty">No data</div>`; return; }
-    const rows = d.robot_ids.map((rid,i)=>`
-      <div class="row">
-        <div class="rlabel" title="${escapeAttr(rid)}">${escapeHtml(shortenId(rid))}</div>
-        ${d.grid[i].map(v=>`<div class="cell" style="background:${riskColor(v)}" title="${v}%"></div>`).join("")}
-      </div>`).join("");
-    const labels = `<div class="clabels">${d.weeks.map(w=>`<span>${escapeHtml(w)}</span>`).join("")}</div>`;
-    grid.innerHTML = rows + labels;
-  }catch(e){ console.error(e); }
-}
-
-function riskColor(v){
-  if (v>=60) return "#ef4444";
-  if (v>=45) return "#f97316";
-  if (v>=30) return "#f59e0b";
-  if (v>=15) return "#fde047";
-  return "#86efac";
-}
-
-async function loadDegradation(){
-  try{
-    const d = await fetchJson(`/api/predictions/degradation?category=${encodeURIComponent(state.pred.category)}`);
-    renderDegradation("lstmChart", "lstmBadge", d, "#3b82f6", false);
-    renderDegradation("rfChart", "rfBadge", d, "#10b981", true);
-  }catch(e){ console.error(e); }
-}
-
-function renderDegradation(canvasId, badgeId, d, color, useRf){
-  charts[canvasId]?.destroy();
-  const ctx = document.getElementById(canvasId).getContext("2d");
-  const predData = useRf ? d.rf_pred : d.lstm_pred;
-  charts[canvasId] = new Chart(ctx,{
-    type:"line",
-    data:{ labels:d.labels,
-      datasets:[
-        {label:"Actual", data:d.actual, borderColor:color, backgroundColor:"transparent",
-         borderWidth:2, tension:0.3, pointRadius:2, spanGaps:false},
-        {label:"Predicted", data:predData, borderColor:color, backgroundColor:"transparent",
-         borderWidth:2, borderDash:[5,5], tension:0.3, pointRadius:2, spanGaps:false},
-      ]
-    },
-    options:{ responsive:true, maintainAspectRatio:false,
-      plugins:{legend:{display:true, position:"top", labels:{boxWidth:10, font:{size:10}}}},
-      scales:{ x:{grid:{display:false}, ticks:{color:"#94a3b8", font:{size:10}}},
-               y:{beginAtZero:true, max:100, grid:{color:"#eef2f7"}, ticks:{color:"#94a3b8", font:{size:10}}} } }
-  });
-  if (d.predicted_failure_label){
-    document.getElementById(badgeId).innerHTML = `Predicted Failure<br><strong>${escapeHtml(d.predicted_failure_label)}</strong>`;
-  } else { document.getElementById(badgeId).textContent = "—"; }
-}
-
-async function loadPredStats(){
-  try{
-    const d = await fetchJson("/api/predictions/stats");
-    setPredCard("predFleet","predFleetTrend","predFleetBar", d.fleet_health.value+"%", d.fleet_health.delta_pct, d.fleet_health.value);
-    setPredCard("predHighRisk","predHighRiskTrend","predHighRiskBar", d.high_risk.value, d.high_risk.delta_pct, Math.min(100, d.high_risk.value*12));
-    setPredCard("predFail","predFailTrend","predFailBar", d.predicted_fail.value, d.predicted_fail.delta_pct, Math.min(100, d.predicted_fail.value*12));
-    setPredCard("predAcc","predAccTrend","predAccBar", d.model_accuracy.value+"%", d.model_accuracy.delta_pct, d.model_accuracy.value);
-  }catch(e){ console.error(e); }
-}
-
-function setPredCard(valId, trendId, barId, val, delta, barPct){
-  document.getElementById(valId).textContent = val;
-  renderTrend(trendId, delta);
-  document.getElementById(barId).style.width = `${Math.max(0, Math.min(100, barPct))}%`;
-}
-
-async function loadTopFailures(){
-  try{
-    const d = await fetchJson("/api/predictions/top-failures");
-    const root = document.getElementById("predCardsContainer");
-    if (!d.items.length){ root.innerHTML = `<div class="empty">No predictions available</div>`; return; }
-    root.innerHTML = d.items.slice(0,5).map(it=>{
-      const rk = it.risk_level.split(" ")[0];
-      return `
-        <div class="pred-card ${rk}">
-          <div class="head">
-            <div class="thumb">${robotSvg()}</div>
-            <div>
-              <div class="id">${escapeHtml(shortenId(it.robot_id))}</div>
-              <div class="area">${escapeHtml(it.area)}</div>
-            </div>
-          </div>
-          <div class="prob-row">
-            <span class="prob" style="color:${rk==='Critical'?'var(--red)':rk==='High'?'var(--amber)':rk==='Medium'?'#a16207':'var(--green)'}">${it.failure_probability}%</span>
-            <span class="risk-pill ${rk}">${escapeHtml(it.risk_level)}</span>
-          </div>
-          <div><div class="label-sm">Failure Probability</div></div>
-          <div><div class="label-sm">Predicted Issue</div><div class="issue">${escapeHtml(it.predicted_issue)}</div></div>
-          <div><div class="label-sm">Estimated Time</div><div class="time">${formatLong(it.estimated_time)}</div></div>
-          <button class="btn-view" onclick="openRobotModal('${escapeAttr(it.robot_id)}')">View Details</button>
-        </div>`;
-    }).join("");
-  }catch(e){ console.error(e); }
-}
-
-async function loadModelInfo(){
-  try{
-    const d = await fetchJson("/api/model-info");
-    if (!d.model_name){ document.getElementById("modelInfoCard").textContent = "No model registered."; return; }
-    const m = d.metrics || {};
-    document.getElementById("modelInfoCard").innerHTML = `
-      <h3 style="margin-top:0">${escapeHtml(d.model_name)}</h3>
-      <p style="color:var(--text-mute);margin-top:0">Status: <strong>${escapeHtml(d.status)}</strong> · Retrained: <strong>${d.retrained}</strong> · Dataset: <strong>${(d.dataset_row_count||0).toLocaleString()} rows</strong></p>
-      <div class="meta-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-top:14px">
-        ${Object.entries(m).filter(([k])=>!["metric_source"].includes(k)).map(([k,v])=>`
-          <div style="background:#f9fafc;border-radius:8px;padding:12px">
-            <div style="font-size:11px;color:var(--text-mute);text-transform:uppercase">${escapeHtml(k)}</div>
-            <div style="font-size:18px;font-weight:700">${typeof v==="number" ? (v<1 ? (v*100).toFixed(2)+"%" : v) : escapeHtml(String(v))}</div>
-          </div>`).join("")}
-      </div>`;
-  }catch(e){ document.getElementById("modelInfoCard").textContent = "Failed: " + e; }
-}
-
-function renderPagination(navId, infoId, {total, page, page_size}, onGo, noun){
-  const totalPages = Math.max(1, Math.ceil(total/page_size));
-  const startN = total===0 ? 0 : (page-1)*page_size + 1;
-  const endN = Math.min(total, page*page_size);
-  document.getElementById(infoId).textContent = `Showing ${startN} to ${endN} of ${total} ${noun}`;
-  const nav = document.getElementById(navId);
-  const html = [`<button ${page===1?"disabled":""} data-go="${page-1}">‹</button>`];
-  for (const p of pageWindow(page, totalPages, 5)){
-    html.push(`<button class="${p===page?"active":""}" data-go="${p}">${p}</button>`);
-  }
-  html.push(`<button ${page===totalPages?"disabled":""} data-go="${page+1}">›</button>`);
-  nav.innerHTML = html.join("");
-  nav.querySelectorAll("button[data-go]").forEach(btn=>{
-    btn.addEventListener("click", ()=>{
-      const t = parseInt(btn.dataset.go, 10);
-      if (!isNaN(t) && t>=1 && t<=totalPages) onGo(t);
-    });
-  });
-}
-
-function pageWindow(current, total, span=5){
-  const half = Math.floor(span/2);
-  let start = Math.max(1, current-half);
-  let end = Math.min(total, start+span-1);
-  start = Math.max(1, end-span+1);
-  const out=[]; for(let i=start;i<=end;i++) out.push(i); return out;
-}
-
-async function openRobotModal(robotId){
-  const backdrop = document.getElementById("modalBackdrop");
-  const body = document.getElementById("modalBody");
-  document.getElementById("modalTitle").textContent = `Robot ${shortenId(robotId)}`;
-  body.innerHTML = "Loading…"; backdrop.hidden = false;
-  try{
-    const d = await fetchJson(`/api/robot/${encodeURIComponent(robotId)}`);
-    body.innerHTML = `
-      <div class="meta-grid">
-        <div><span class="k">Robot ID</span><span class="v">${escapeHtml(d.robot_id)}</span></div>
-        <div><span class="k">Product</span><span class="v">${escapeHtml(d.product_code || "-")}</span></div>
-        <div><span class="k">SN</span><span class="v">${escapeHtml(d.sn || "-")}</span></div>
-        <div><span class="k">MAC</span><span class="v">${escapeHtml(d.mac || "-")}</span></div>
-        <div><span class="k">Software</span><span class="v">${escapeHtml(d.soft_version || "-")}</span></div>
-        <div><span class="k">OS</span><span class="v">${escapeHtml(d.os_version || "-")}</span></div>
-      </div>
-      <h4>Recent Logs (latest 20)</h4>
-      <table>
-        <thead><tr><th>Time</th><th>Type</th><th>Detail</th><th>Level</th><th>Ratio</th></tr></thead>
-        <tbody>
-          ${d.recent_logs.map(l=>`
-            <tr>
-              <td>${formatLong(l.task_time)}</td>
-              <td>${escapeHtml(l.error_type || "")}</td>
-              <td>${escapeHtml(l.error_detail || "")}</td>
-              <td>${escapeHtml(l.error_level || "")}</td>
-              <td>${(l.hourly_ratio*100).toFixed(1)}%</td>
-            </tr>`).join("")}
-        </tbody>
-      </table>`;
-  }catch(e){ body.innerHTML = `<p>Failed: ${escapeHtml(String(e))}</p>`; }
-}
-function closeModal(){ document.getElementById("modalBackdrop").hidden = true; }
-
-document.addEventListener("keydown", e=>{
-  if (e.key==="Escape"){ closeModal(); closeDatePicker(); closeNotifPanel(); }
-});
-document.getElementById("modalBackdrop").addEventListener("click", e=>{ if (e.target.id==="modalBackdrop") closeModal(); });
-document.addEventListener("click", e=>{
-  // outside-click closing for popovers
-  const dp = document.getElementById("datePopover");
-  const np = document.getElementById("notifPanel");
-  if (!dp.hidden && !e.target.closest(".date-picker") && !e.target.closest("#datePopover")) dp.hidden = true;
-  if (!np.hidden && !e.target.closest(".bell") && !e.target.closest("#notifPanel")) np.hidden = true;
-});
-
-// =========================================================================
-// Date picker
-// =========================================================================
-function toggleDatePicker(ev, triggerId){
-  ev.stopPropagation();
-  const pop = document.getElementById("datePopover");
-  if (!pop.hidden){ pop.hidden = true; return; }
-  closeNotifPanel();
-  // Position the popover under the trigger button
-  const btn = document.getElementById(triggerId);
-  const r = btn.getBoundingClientRect();
-  pop.style.top = (window.scrollY + r.bottom + 6) + "px";
-  pop.style.right = (window.innerWidth - r.right) + "px";
-  pop.style.left = "auto";
-  // populate inputs
-  document.getElementById("rangeStartInput").value = state.range.start || isoDate(state.range.extentStart);
-  document.getElementById("rangeEndInput").value   = state.range.end   || isoDate(state.range.extentEnd);
-  pop.hidden = false;
-}
-function closeDatePicker(){ document.getElementById("datePopover").hidden = true; }
-
-function isoDate(iso){
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return "";
-  return d.toISOString().slice(0, 10);
-}
-
-function applyRange(){
-  state.range.start = document.getElementById("rangeStartInput").value || "";
-  state.range.end   = document.getElementById("rangeEndInput").value   || "";
-  closeDatePicker();
-  reloadCurrentPage();
-}
-function resetRange(){
-  state.range.start = ""; state.range.end = "";
-  document.getElementById("rangeStartInput").value = isoDate(state.range.extentStart);
-  document.getElementById("rangeEndInput").value   = isoDate(state.range.extentEnd);
-  reloadCurrentPage();
-}
-function applyQuickRange(value){
-  if (value === "all"){
-    state.range.start = ""; state.range.end = "";
-  } else {
-    const days = Number(value);
-    const end = state.range.extentEnd ? new Date(state.range.extentEnd) : new Date();
-    const start = new Date(end); start.setDate(start.getDate() - days + 1);
-    state.range.start = isoDate(start.toISOString());
-    state.range.end   = isoDate(end.toISOString());
-  }
-  closeDatePicker();
-  reloadCurrentPage();
-}
-
-function reloadCurrentPage(){
-  const active = document.querySelector(".page.active");
-  if (!active) return;
-  const id = active.id.replace("page-", "");
-  if (id === "dashboard")     loadDashboard();
-  if (id === "fault-history") loadFaultHistory();
-  if (id === "predictions")   loadPredictions();
-}
-
-// =========================================================================
-// Notifications
-// =========================================================================
-function toggleNotifPanel(ev){
-  ev.stopPropagation();
-  const np = document.getElementById("notifPanel");
-  if (!np.hidden){ np.hidden = true; return; }
-  closeDatePicker();
-  // position near the bell that was clicked
-  const btn = ev.currentTarget.getBoundingClientRect();
-  np.style.top = (window.scrollY + btn.bottom + 6) + "px";
-  np.style.right = (window.innerWidth - btn.right - 16) + "px";
-  np.style.left = "auto";
-  np.hidden = false;
-  loadNotifications();
-}
-function closeNotifPanel(){ document.getElementById("notifPanel").hidden = true; }
-
-async function loadNotifications(){
-  const list = document.getElementById("notifList");
-  list.innerHTML = `<li class="notif-empty">Loading…</li>`;
-  try{
-    const d = await fetchJson("/api/notifications?limit=20");
-    state.notifications.items = d.items;
-    updateBellBadge(d.items.length);
-    if (!d.items.length){ list.innerHTML = `<li class="notif-empty">No active alerts</li>`; return; }
-    list.innerHTML = d.items.map(it=>`
-      <li>
-        <div class="sev ${it.severity}"></div>
-        <div>
-          <div class="title">${escapeHtml(it.title)}</div>
-          <div class="body" title="${escapeAttr(it.detail || '')}">${escapeHtml(shortenId(it.robot_id))} · ${escapeHtml(it.detail || it.level || '')}</div>
-        </div>
-        <div class="when">${formatLong(it.task_time)}</div>
-      </li>`).join("");
-  }catch(e){
-    list.innerHTML = `<li class="notif-empty">Failed: ${escapeHtml(String(e))}</li>`;
-  }
-}
-
-function updateBellBadge(n){
-  ["bellBadge","bellBadge2","bellBadge3"].forEach(id=>{
-    const el = document.getElementById(id);
-    if (!el) return;
-    el.textContent = n > 99 ? "99+" : String(n);
-    el.style.display = n ? "" : "none";
-  });
-}
-
-function markAllRead(){
-  updateBellBadge(0);
-  state.notifications.dismissedAt = Date.now();
-  closeNotifPanel();
-}
-
-// Refresh notification badge on first load (independent of page)
-async function refreshNotificationBadge(){
-  try{
-    const d = await fetchJson("/api/notifications?limit=20");
-    state.notifications.items = d.items;
-    updateBellBadge(d.items.length);
-  }catch{}
-}
-
-// Set the top-bar date label as soon as we know the data extent — this fires
-// independently of whichever page is active, so the label never gets stuck on
-// "Date range ▾" if the page-specific loader is slow or fails.
-async function initDateLabel(){
-  try{
-    const d = await fetchJson("/api/stats");
-    if (d.range?.start && d.range?.end){
-      state.range.extentStart = d.range.start;
-      state.range.extentEnd   = d.range.end;
-      updateDateLabel(d.range.start, d.range.end);
-    }
-  }catch{}
-}
-
-document.addEventListener("DOMContentLoaded", ()=>{
-  refreshNotificationBadge();
-  initDateLabel();
-});
-
-async function fetchJson(url){
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-  return r.json();
-}
-function debounce(fn, ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
-function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
-function escapeAttr(s){ return escapeHtml(s); }
-function shortenId(id){ if (!id) return ""; return id.length>12 ? "RC-"+id.slice(-8) : id; }
-function formatRange(iso){ return new Date(iso).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}); }
-function formatShortDate(iso){ return new Date(iso).toLocaleDateString("en-US",{month:"short",day:"numeric"}); }
-function formatLong(iso){ if (!iso) return "—";
-  return new Date(iso).toLocaleString("en-US",{month:"short",day:"numeric",year:"numeric",hour:"2-digit",minute:"2-digit",hour12:false}); }
-function formatDate(iso){ if (!iso) return "—";
-  return new Date(iso).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}); }
-function formatTimeOnly(iso){ if (!iso) return "";
-  return new Date(iso).toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit",hour12:false}); }
-function robotSvg(){
-  return `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-    <rect x="4" y="8" width="16" height="11" rx="2"></rect>
-    <path d="M8 8V6a4 4 0 0 1 8 0v2"></path>
-    <circle cx="9" cy="13" r="1"></circle><circle cx="15" cy="13" r="1"></circle></svg>`;
-}
+function renderBar(id, labels, data, label){ const ctx=document.getElementById(id).getContext('2d'); charts[id]?.destroy(); charts[id]=new Chart(ctx,{type:'bar',data:{labels,datasets:[{label,data,backgroundColor:'#2563eb',borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false}},y:{beginAtZero:true,grid:{color:'#eef2f7'}}}}}); }
+function renderStacked(id, labels, datasets){ const ctx=document.getElementById(id).getContext('2d'); charts[id]?.destroy(); charts[id]=new Chart(ctx,{type:'bar',data:{labels,datasets},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'}},scales:{x:{stacked:true,grid:{display:false}},y:{stacked:true,beginAtZero:true,grid:{color:'#eef2f7'}}}}}); }
+function renderDonut(id, labels, data){ const ctx=document.getElementById(id).getContext('2d'); charts[id]?.destroy(); charts[id]=new Chart(ctx,{type:'doughnut',data:{labels,datasets:[{data,backgroundColor:labels.map((_,i)=>palette[i%palette.length]),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,cutout:'68%',plugins:{legend:{position:'bottom'}}}}); }
+function renderPager(id,page,total,onGo){ const root=document.getElementById(id); const pages=[]; pages.push(`<button ${page<=1?'disabled':''} data-p="${page-1}">‹</button>`); for(let i=Math.max(1,page-2);i<=Math.min(total,page+2);i++)pages.push(`<button class="${i===page?'active':''}" data-p="${i}">${i}</button>`); pages.push(`<button ${page>=total?'disabled':''} data-p="${page+1}">›</button>`); root.innerHTML=pages.join(''); root.querySelectorAll('button[data-p]').forEach(b=>b.onclick=()=>{const p=Number(b.dataset.p); if(p>=1&&p<=total)onGo(p);}); }
+async function fetchJson(url){ const r=await fetch(url); if(!r.ok) throw new Error(`${r.status} ${r.statusText}`); return r.json(); }
+function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms)}}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function isoDate(iso){if(!iso)return'';const d=new Date(iso);return isNaN(d)?'':d.toISOString().slice(0,10)}
+function fmtDateTime(iso){if(!iso)return'—';const d=new Date(iso);return isNaN(d)?'—':d.toLocaleString('tr-TR',{month:'short',day:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'})}
+function fmtShort(iso){const d=new Date(iso);return isNaN(d)?'—':d.toLocaleDateString('tr-TR',{month:'short',day:'2-digit'})}
+function shortId(id){id=String(id||''); return id.length>12 ? 'RC-'+id.slice(-8) : esc(id)}
 </script>
 </body>
 </html>
