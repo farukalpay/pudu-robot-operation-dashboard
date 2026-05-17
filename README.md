@@ -1,50 +1,64 @@
-# RoboClean Predictive Maintenance Dashboard
+# PUDU Robot Operation Dashboard
 
-Single-file FastAPI dashboard for the Bahçeşehir University capstone project
-**Fault Prediction and Diagnostics from Robot Operation Logs**.
+FastAPI + DuckDB dashboard for the PUDU robot predictive maintenance dataset.
+The app now treats the model-training repository as the source of truth for the
+LSTM V2 four-head contract.
 
-The dashboard reads the published Hugging Face dataset snapshot directly via
-DuckDB — no live PostgreSQL connection required.
+## Runtime Model Source
 
-## Pages
+On every app process start, the dashboard clones this repository into a fresh
+temporary directory:
 
-| Hash route          | Description |
-|---------------------|-------------|
-| `/#dashboard`       | Fleet KPIs, anomaly trend, fault distribution donut, robot health table |
-| `/#predictions`     | Fleet risk heatmap, LSTM & RF degradation projections, 4 KPI cards, top failure prediction cards |
-| `/#fault-history`   | Monthly fault frequency (stacked bar), filterable historical fault log with date range / status / resolution |
-| `/#model`           | Latest training-run metrics (accuracy/recall/precision/AUC) |
+```
+https://github.com/DrGb24/pudu_bot_model_training.git
+```
 
-Sidebar items `Robot Monitoring`, `Maintenance Logs`, `Settings` are clickable
-placeholder pages.
+The dashboard reads the model contract from that checkout:
+
+- Head 1: `Anlık arıza`
+- Head 2: `Şiddet`
+- Head 3: `7 günlük öngörü`
+- Head 4: `Arıza süresi`
+- Feature columns, severity labels, failure levels, component labels, future
+  window, and README metrics
+
+If the cloned repo contains the V2 weight/config/scaler files under
+`models/lstm_v2/`, the runtime attempts to load `LSTMInferenceV2`. The current
+public repo does not include those weights, so the dashboard transparently runs
+in `dataset_target_replay` mode: it reconstructs the four training targets from
+the Hugging Face snapshot instead of pretending to have live model inference.
 
 ## Data Source
 
-Default dataset (Hugging Face):
+Default Hugging Face dataset:
 
 ```
 Lightcap/pudu-robot-operation-logs-bau-capstone-2026
 ```
 
-URL: <https://huggingface.co/datasets/Lightcap/pudu-robot-operation-logs-bau-capstone-2026>
+The Parquet files are downloaded through `huggingface_hub` and registered as
+DuckDB views. No live PostgreSQL connection is required.
 
-DOI: `10.57967/hf/8635`
+## Pages
 
-At startup, `app.py` downloads the Parquet files with `huggingface_hub`,
-registers them as DuckDB views, and serves the same API contract the previous
-PostgreSQL-backed version exposed.
+| Hash route | Description |
+|---|---|
+| `/#dashboard` | Four LSTM V2 head cards, 7-day horizon chart, severity/component summary, priority robots |
+| `/#robots` | Robot-level Head 1-4 outputs with date/reference controls |
+| `/#history` | Historical fault frequency and log browser |
+| `/#model` | Fresh GitHub checkout status, parsed metrics, feature contract, runtime notes |
 
 ## Run Locally
 
 ```bash
 pip install -r requirements.txt
-python app.py
+python3 app.py
 ```
 
 Open <http://127.0.0.1:8000>.
 
-The first launch downloads ~30 MB of Parquet snapshots; subsequent runs are
-served from the local Hugging Face cache.
+First launch downloads the dataset snapshot. Every process start also performs a
+fresh temporary clone of the configured model-training repo.
 
 ## Configuration
 
@@ -53,45 +67,37 @@ served from the local Hugging Face cache.
 | `HF_DATASET_REPO` | `Lightcap/pudu-robot-operation-logs-bau-capstone-2026` | Hugging Face dataset repository |
 | `HF_DATASET_REVISION` | `main` | Dataset revision/commit/branch |
 | `DASHBOARD_DUCKDB_PATH` | `:memory:` | Optional DuckDB database path |
+| `PUDU_MODEL_REPO_URL` | `https://github.com/DrGb24/pudu_bot_model_training.git` | Runtime model-training repository |
+| `PUDU_MODEL_REPO_REF` | `main` | Branch/tag to clone each run |
 
 ## API
 
 | Endpoint | Purpose |
 |---|---|
-| `/api/health` | Dataset status |
-| `/api/stats` | Fleet KPI cards (active / critical / fleet health) |
-| `/api/anomaly-trend` | Time-bucketed anomaly trend (auto day/week/month) |
-| `/api/fault-distribution` | Top error types + Other |
-| `/api/robots` | Paginated latest robot status table |
-| `/api/robot/{robot_id}` | Recent 20 logs for one robot |
-| `/api/filter-options` | Robot IDs, fault types, categories, statuses |
-| `/api/model-info` | Registered LSTM training metadata |
-| `/api/fault-history/frequency` | Monthly stacked fault counts by category |
-| `/api/fault-history/list` | Paginated, filterable fault log |
-| `/api/predictions/heatmap` | Robot × weekly risk grid |
-| `/api/predictions/degradation` | Per-category health-score trace + projection |
-| `/api/predictions/stats` | 4 prediction KPIs |
-| `/api/predictions/top-failures` | Top 10 high-probability failures |
+| `/api/health` | Dataset and model-runtime status |
+| `/api/model-runtime` | Fresh clone status, commit, parsed contract, artifact availability |
+| `/api/model-info` | Runtime contract plus registered dataset training metadata |
+| `/api/model-heads/summary` | Four-head fleet summary for the selected reference/horizon |
+| `/api/model-heads/robots` | Paginated robot-level Head 1-4 outputs |
+| `/api/model-heads/timeline` | Future-window fault counts for the selected reference |
+| `/api/fault-history/frequency` | Monthly stacked fault counts by model-repo component labels |
+| `/api/fault-history/list` | Paginated, filterable historical fault log |
 
-## Tech
+Legacy endpoints are still present for compatibility, but the UI uses the
+`/api/model-heads/*` surface.
 
-- Backend: FastAPI + DuckDB over Hugging Face Parquet
-- Frontend: Vanilla JS + Chart.js (single inlined HTML payload)
-- Hash-based SPA routing (Dashboard / Predictions / Fault History / Model)
-- Mobile responsive at 1100 / 880 / 760 / 520 px breakpoints
-
-## File layout
+## File Layout
 
 ```
 dashboard/
-├── app.py            # Everything: FastAPI + DuckDB loader + HTML/CSS/JS
+├── app.py                  # FastAPI routes + HTML/CSS/JS shell
+├── pudu_model_runtime.py   # Temporary GitHub checkout + model contract parser
 ├── requirements.txt
-├── run.bat           # Windows convenience launcher
+├── run.bat
 └── README.md
 ```
 
 ## Project References
 
 - Dataset: <https://huggingface.co/datasets/Lightcap/pudu-robot-operation-logs-bau-capstone-2026>
-- Dashboard repository: <https://github.com/farukalpay/pudu-robot-operation-dashboard>
 - Model training repository: <https://github.com/DrGb24/pudu_bot_model_training/>
