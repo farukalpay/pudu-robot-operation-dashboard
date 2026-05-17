@@ -131,6 +131,29 @@ class PuduModelRuntime:
                 return metric
         return None
 
+    def predict_for_robot(
+        self,
+        robot_id: str,
+        rows: list[dict[str, Any]],
+        reference: datetime,
+    ) -> dict[str, Any] | None:
+        """Run the external inference engine when trained artifacts are available."""
+        self.ensure_loaded()
+        if self._engine is None or not rows:
+            return None
+        try:
+            import pandas as pd
+
+            df = pd.DataFrame(rows)
+            return self._engine.predict_for_robot(
+                robot_id=robot_id,
+                robot_df=df,
+                reference_date=pd.Timestamp(reference.date()),
+            )
+        except Exception as exc:
+            log.warning("Model inference failed for robot %s: %s", robot_id, exc)
+            return None
+
     def _load(self) -> RuntimeSnapshot:
         checked_out_at = datetime.now(timezone.utc).isoformat()
         if shutil.which("git") is None:
@@ -330,4 +353,3 @@ def _parse_metric_values(raw: str) -> tuple[dict[str, float], str | None]:
 
 
 MODEL_RUNTIME = PuduModelRuntime()
-
