@@ -320,6 +320,25 @@ def _format_hours(hours: float | None) -> str:
         return f"{hours:.1f} saat"
     return f"{hours / 24:.1f} gün"
 
+
+def _prediction_horizon_hours(snapshot: RuntimeSnapshot, days: int) -> int:
+    return max(1, int(days)) * 24
+
+
+def _bucket_keys(start: datetime, end: datetime, grain: str) -> list[datetime]:
+    if grain == "week":
+        cursor = datetime(start.year, start.month, start.day) - timedelta(days=start.weekday())
+        step = timedelta(days=7)
+    else:
+        cursor = datetime(start.year, start.month, start.day)
+        step = timedelta(days=1)
+    last = datetime(end.year, end.month, end.day)
+    keys: list[datetime] = []
+    while cursor <= last:
+        keys.append(cursor)
+        cursor += step
+    return keys
+
 # ============================================================================
 # API: shared
 # ============================================================================
@@ -728,44 +747,89 @@ def api_pred_heatmap(
     days: int | None = Query(default=None, ge=1, le=730),
     robot_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
-    """Per-robot weekly risk grid. `days` overrides `weeks` when supplied."""
+    """Per-robot forward risk grid. `days` overrides `weeks` when supplied."""
     with get_cursor() as cur:
-        _start, end = _data_window(cur)
-        if days is not None:
-            win_start = end - timedelta(days=days)
-        else:
-            win_start = end - timedelta(weeks=weeks)
-        params: list[Any] = [win_start, end]
-        sql = """
+        snapshot = MODEL_RUNTIME.snapshot()
+        horizon_days = days if days is not None else weeks * 7
+        horizon_hours = _prediction_horizon_hours(snapshot, horizon_days)
+        robot = robot_id if robot_id and robot_id.lower() not in ("", "all", "all robots") else None
+        if snapshot.engine_available:
+            items, meta = _head_rows(cur, None, None, horizon_hours, robot)
+            if not items:
+                return {"robot_ids": [], "weeks": [], "grid": [], **meta}
+            if robot:
+                active_items = items
+            else:
+                active_items = sorted(
+                    items,
+                    key=lambda item: (
+                        -(item["head_3"]["next_7d_fail_prob"] or 0),
+                        item["robot_id"],
+                    ),
+                )[:8]
+            return {
+                **meta,
+                "robot_ids": [item["robot_id"] for item in active_items],
+                "weeks": [f"Next {horizon_days}d"],
+                "grid": [[item["head_3"]["next_7d_fail_prob"] or 0] for item in active_items],
+                "source": _model_source(snapshot),
+            }
+
+        reference_rows, _start, reference = _head_reference_rows(cur, None, None, horizon_hours, robot)
+        robot_ids = [r["robot_id"] for r in reference_rows if r["robot_id"]]
+        if not robot_ids:
+            return {"robot_ids": [], "weeks": [], "grid": []}
+
+        _data_start, data_end = _data_window(cur)
+        observed_end = min(reference + timedelta(hours=horizon_hours), data_end)
+        if observed_end <= reference:
+            return {
+                "robot_ids": robot_ids[:1] if robot else robot_ids[:8],
+                "weeks": [],
+                "grid": [],
+                "source": _model_source(snapshot),
+                "reference_time": reference.isoformat(),
+                "horizon_hours": horizon_hours,
+            }
+
+        grain = "day" if horizon_hours <= 14 * 24 else "week"
+        failure_sql, failure_params = _failure_condition_sql("error_level")
+        placeholders = ",".join(["%s"] * len(robot_ids))
+        cur.execute(
+            f"""
             SELECT robot_id,
-                   date_trunc('week', task_time) AS bkt,
-                   AVG(hourly_ratio) AS risk
+                   date_trunc('{grain}', task_time) AS bkt,
+                   COUNT(*) AS events,
+                   MAX(hourly_ratio) AS risk
             FROM public.robot_logs_error
-            WHERE task_time BETWEEN %s AND %s AND robot_id IS NOT NULL
-        """
-        if robot_id and robot_id.lower() not in ("", "all", "all robots"):
-            sql += " AND robot_id = %s"
-            params.append(robot_id)
-        sql += " GROUP BY robot_id, bkt ORDER BY robot_id, bkt;"
-        cur.execute(sql, params)
+            WHERE task_time > %s
+              AND task_time <= %s
+              AND robot_id IN ({placeholders})
+              AND ({failure_sql})
+            GROUP BY robot_id, bkt
+            ORDER BY robot_id, bkt;
+            """,
+            [reference, observed_end, *robot_ids, *failure_params],
+        )
         rows = cur.fetchall()
-        robots: dict[str, dict[datetime, float]] = {}
-        weeks_set: set[datetime] = set()
+        bucket_keys = _bucket_keys(reference, observed_end, grain)
+        robots: dict[str, dict[datetime, float]] = {rid: {b: 0.0 for b in bucket_keys} for rid in robot_ids}
         for r in rows:
-            week = r["bkt"]
-            weeks_set.add(week)
-            robots.setdefault(r["robot_id"], {})[week] = round(float(r["risk"] or 0) * 100, 1)
-        week_keys = sorted(weeks_set)
-        week_labels = [week.strftime("%b %d") for week in week_keys]
-        # If a specific robot was requested, show only that robot; otherwise top 8 noisiest
-        if robot_id and robot_id.lower() not in ("", "all", "all robots"):
-            active_robots = list(robots.items())
+            bucket = r["bkt"]
+            if bucket in robots.get(r["robot_id"], {}):
+                robots[r["robot_id"]][bucket] = round(float(r["risk"] or 0) * 100, 1)
+        bucket_labels = [bucket.strftime("%b %d") for bucket in bucket_keys]
+        if robot:
+            active_robots = [(rid, robots[rid]) for rid in robot_ids]
         else:
             active_robots = sorted(robots.items(), key=lambda kv: -sum(kv[1].values()))[:8]
         return {
             "robot_ids": [rid for rid, _ in active_robots],
-            "weeks": week_labels,
-            "grid": [[active_robots[i][1].get(w, 0) for w in week_keys] for i in range(len(active_robots))],
+            "weeks": bucket_labels,
+            "grid": [[active_robots[i][1].get(bucket, 0) for bucket in bucket_keys] for i in range(len(active_robots))],
+            "source": "future_target_window",
+            "reference_time": reference.isoformat(),
+            "horizon_hours": horizon_hours,
         }
 
 
@@ -779,7 +843,7 @@ def api_pred_degradation(
 ) -> dict[str, Any]:
     with get_cursor() as cur:
         snapshot = MODEL_RUNTIME.snapshot()
-        horizon_hours = snapshot.future_window_hours or days * 24
+        horizon_hours = _prediction_horizon_hours(snapshot, days)
         ext_start, ext_end = _data_window(cur)
         reference = _parse_date(end_date, end_of_day=True)
         if reference is None:
@@ -821,7 +885,18 @@ def api_pred_degradation(
         observed_end = min(reference + timedelta(hours=horizon_hours), ext_end)
         future_labels: list[str] = []
         future_values: list[float] = []
-        if observed_end > reference:
+        if snapshot.engine_available:
+            robot = robot_id if robot_id and robot_id.lower() not in ("", "all", "all robots") else None
+            head_rows, _meta = _head_rows(cur, None, None, horizon_hours, robot)
+            probabilities = []
+            for row in head_rows:
+                if category and category.lower() not in ("", "all", "all components") and row["component"] != category:
+                    continue
+                probabilities.append(float(row["head_3"]["next_7d_fail_prob"] or 0))
+            if probabilities:
+                future_labels.append(f"Next {days}d")
+                future_values.append(round(sum(probabilities) / len(probabilities), 1))
+        elif observed_end > reference:
             failure_sql, failure_params = _failure_condition_sql("error_level")
             future_params: list[Any] = [reference, observed_end, *failure_params]
             cur.execute(
@@ -873,7 +948,7 @@ def api_pred_stats(
 ) -> dict[str, Any]:
     with get_cursor() as cur:
         snapshot = MODEL_RUNTIME.snapshot()
-        horizon_hours = snapshot.future_window_hours or days * 24
+        horizon_hours = _prediction_horizon_hours(snapshot, days)
         robot = robot_id if robot_id and robot_id.lower() not in ("", "all", "all robots") else None
         items, meta = _head_rows(cur, start_date, end_date, horizon_hours, robot)
         total = len(items)
@@ -974,7 +1049,7 @@ def api_top_failures(
 ) -> dict[str, Any]:
     with get_cursor() as cur:
         snapshot = MODEL_RUNTIME.snapshot()
-        horizon_hours = snapshot.future_window_hours or days * 24
+        horizon_hours = _prediction_horizon_hours(snapshot, days)
         robot = robot_id if robot_id and robot_id.lower() not in ("", "all", "all robots") else None
         rows, meta = _head_rows(cur, start_date, end_date, horizon_hours, robot)
         selected_head = head if head in {"1", "2", "3", "4"} else "3"
@@ -1148,7 +1223,7 @@ def _engine_history_by_robot(
 
 
 def _model_source(snapshot: RuntimeSnapshot) -> str:
-    return "lstm_v2_inference" if snapshot.engine_available else "dataset_target_replay"
+    return snapshot.engine_kind if snapshot.engine_available and snapshot.engine_kind else "dataset_target_replay"
 
 
 def _head_rows(
@@ -1166,7 +1241,7 @@ def _head_rows(
     if snapshot.engine_available:
         histories = _engine_history_by_robot(cur, start, reference, robot_ids)
         for rid, history in histories.items():
-            prediction = MODEL_RUNTIME.predict_for_robot(rid, history, reference)
+            prediction = MODEL_RUNTIME.predict_for_robot(rid, history, reference, horizon_hours=horizon_hours)
             if prediction:
                 engine_predictions[rid] = prediction
 
@@ -1186,12 +1261,25 @@ def _head_rows(
             severity_tr = prediction.get("severity_now_tr") or severity_label
             current_failure = bool(prediction.get("is_failure_now"))
             evidence_ratio = float(prediction.get("failure_prob_now") or 0)
-            future_ratio = float(prediction.get("next_7d_fail_prob") or prediction.get("future_failure_prob") or 0)
-            future_failure = future_ratio >= MODEL_BINARY_THRESHOLD
-            hours_to_failure = prediction.get("est_hours_to_failure")
+            future_supported = prediction.get("future_horizon_supported")
+            if future_supported is None:
+                supported = set(snapshot.supported_horizon_hours or [])
+                future_supported = not supported or horizon_hours in supported
+            if future_supported:
+                predicted_future = prediction.get("future_failure_prob")
+                if predicted_future is None:
+                    predicted_future = prediction.get("next_7d_fail_prob")
+                future_ratio = float(predicted_future or 0)
+                future_failure = future_ratio >= MODEL_BINARY_THRESHOLD
+                hours_to_failure = prediction.get("est_hours_to_failure")
+                future_source = snapshot.engine_kind or "model_inference"
+            else:
+                future_failure = bool(future)
+                future_ratio = 1.0 if future_failure else 0.0
+                future_source = "dataset_target_replay"
             active_error_types = prediction.get("active_error_types") or []
             error_details = prediction.get("error_details") or []
-            source = "lstm_v2_inference"
+            source = snapshot.engine_kind or "model_inference"
         else:
             severity_score = MODEL_RUNTIME.severity_score(r["error_level"])
             severity_label = snapshot.severity_labels.get(severity_score, r["error_level"] or "Unknown") if severity_score is not None else (r["error_level"] or "Unknown")
@@ -1204,6 +1292,7 @@ def _head_rows(
             active_error_types = [r["error_type"]] if r["error_type"] else []
             error_details = []
             source = _model_source(snapshot)
+            future_source = source
 
         items.append({
             "robot_id": robot_id,
@@ -1229,17 +1318,17 @@ def _head_rows(
                 "source": source,
             },
             "head_3": {
-                "name": "7 günlük öngörü",
+                "name": "Gelecek öngörü",
                 "future_failure_observed": future_failure,
                 "future_failure_events": int(future["future_failure_events"]) if future else 0,
                 "next_7d_fail_prob": _pct(future_ratio),
-                "source": source,
+                "source": future_source,
             },
             "head_4": {
                 "name": "Arıza süresi",
                 "est_hours_to_failure": hours_to_failure,
                 "est_time_label": _format_hours(hours_to_failure),
-                "source": source,
+                "source": future_source,
             },
         })
 
@@ -1278,7 +1367,7 @@ def api_model_heads_summary(
 ) -> dict[str, Any]:
     with get_cursor() as cur:
         snapshot = MODEL_RUNTIME.snapshot()
-        horizon_hours = snapshot.future_window_hours or horizon_days * 24
+        horizon_hours = _prediction_horizon_hours(snapshot, horizon_days)
         items, meta = _head_rows(cur, start_date, end_date, horizon_hours)
         total = len(items)
         current_failures = sum(1 for item in items if item["head_1"]["is_failure_now"])
@@ -1314,7 +1403,7 @@ def api_model_heads_summary(
                 },
                 {
                     "id": "head_3",
-                    "name": "7 günlük öngörü",
+                    "name": "Gelecek öngörü",
                     "metric": _metric_dict(snapshot, "head_3"),
                     "value": future_failures,
                     "unit": "robots",
@@ -1345,7 +1434,7 @@ def api_model_head_robots(
 ) -> dict[str, Any]:
     with get_cursor() as cur:
         snapshot = MODEL_RUNTIME.snapshot()
-        horizon_hours = snapshot.future_window_hours or horizon_days * 24
+        horizon_hours = _prediction_horizon_hours(snapshot, horizon_days)
         items, meta = _head_rows(cur, start_date, end_date, horizon_hours, robot)
         total = len(items)
         start_idx = (page - 1) * page_size
@@ -1366,7 +1455,7 @@ def api_model_head_timeline(
 ) -> dict[str, Any]:
     with get_cursor() as cur:
         snapshot = MODEL_RUNTIME.snapshot()
-        horizon_hours = snapshot.future_window_hours or horizon_days * 24
+        horizon_hours = _prediction_horizon_hours(snapshot, horizon_days)
         _rows, _start, reference = _head_reference_rows(cur, start_date, end_date, horizon_hours)
         _data_start, data_end = _data_window(cur)
         requested_end = reference + timedelta(hours=horizon_hours)
@@ -1513,6 +1602,7 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
 .popover .quick button{font-size:11.5px;padding:6px 8px;border-radius:7px;border:1px solid var(--border);
   background:#f9fafc;color:var(--text);cursor:pointer}
 .popover .quick button:hover{background:#eef2f7}
+.popover .future-range{display:none}
 .popover .actions{display:flex;gap:6px;justify-content:flex-end}
 .popover .actions button{padding:6px 14px;border-radius:8px;font-size:12.5px;font-weight:600;cursor:pointer;
   border:1px solid var(--border);background:#fff;color:var(--text)}
@@ -2098,7 +2188,7 @@ table.data tbody tr:last-child td{border-bottom:none}
         </div>
         <div class="topbar-right">
           <button class="bell" aria-label="Notifications" onclick="toggleNotifPanel(event)"><span>🔔</span><span class="bell-badge" id="bellBadge3">0</span></button>
-          <button class="date-picker" id="predDateRange" onclick="toggleDatePicker(event,'predDateRange')">Date range ▾</button>
+          <button class="date-picker" id="predDateRange" onclick="toggleDatePicker(event,'predDateRange')">Next 7 Days ▾</button>
         </div>
       </header>
 
@@ -2106,9 +2196,9 @@ table.data tbody tr:last-child td{border-bottom:none}
         <select class="select" id="predRobotFilter"></select>
         <select class="select" id="predCategoryFilter"></select>
         <select class="select" id="predWindowFilter">
-          <option value="7">Last 7 Days</option>
-          <option value="30">Last 30 Days</option>
-          <option value="90">Last 90 Days</option>
+          <option value="7">Next 7 Days</option>
+          <option value="30">Next 30 Days</option>
+          <option value="90">Next 90 Days</option>
         </select>
       </div>
 
@@ -2202,14 +2292,17 @@ table.data tbody tr:last-child td{border-bottom:none}
 <div class="popover" id="datePopover" hidden onclick="event.stopPropagation()">
   <h4 data-i18n="selectRange">Select Date Range</h4>
   <div class="quick">
-    <button onclick="applyQuickRange(7)" data-i18n="last7">Last 7 days</button>
-    <button onclick="applyQuickRange(30)" data-i18n="last30">Last 30 days</button>
-    <button onclick="applyQuickRange(90)" data-i18n="last90">Last 90 days</button>
-    <button onclick="applyQuickRange('all')" data-i18n="allTime">All time</button>
+    <button class="past-range" onclick="applyQuickRange(7)" data-i18n="last7">Last 7 days</button>
+    <button class="past-range" onclick="applyQuickRange(30)" data-i18n="last30">Last 30 days</button>
+    <button class="past-range" onclick="applyQuickRange(90)" data-i18n="last90">Last 90 days</button>
+    <button class="past-range" onclick="applyQuickRange('all')" data-i18n="allTime">All time</button>
+    <button class="future-range" onclick="applyFutureRange(7)" data-i18n="next7Days">Next 7 Days</button>
+    <button class="future-range" onclick="applyFutureRange(30)" data-i18n="next30Days">Next 30 Days</button>
+    <button class="future-range" onclick="applyFutureRange(90)" data-i18n="next90Days">Next 90 Days</button>
   </div>
-  <div class="row"><label data-i18n="startDate">Start date</label><input type="date" id="rangeStartInput" /></div>
-  <div class="row"><label data-i18n="endDate">End date</label><input type="date" id="rangeEndInput" /></div>
-  <div class="actions">
+  <div class="row past-range"><label data-i18n="startDate">Start date</label><input type="date" id="rangeStartInput" /></div>
+  <div class="row past-range"><label data-i18n="endDate">End date</label><input type="date" id="rangeEndInput" /></div>
+  <div class="actions past-range">
     <button onclick="resetRange()" data-i18n="reset">Reset</button>
     <button class="primary" onclick="applyRange()" data-i18n="apply">Apply</button>
   </div>
@@ -2247,10 +2340,12 @@ const I18N = {
     noRobots:"No robots found", noFaults:"No faults match the filters", noAlerts:"No active alerts",
     showing: "Showing", to: "to", of: "of", robots: "robots", faults: "faults",
     notifications: "Notifications", markAllRead: "Mark all read",
-    selectRange: "Select Date Range", last7:"Last 7 days", last30:"Last 30 days", last90:"Last 90 days", allTime:"All time",
+    selectRange: "Select Date Range", predictionWindow:"Prediction Window",
+    last7:"Last 7 days", last30:"Last 30 days", last90:"Last 90 days", allTime:"All time",
+    next7Days:"Next 7 Days", next30Days:"Next 30 Days", next90Days:"Next 90 Days",
     startDate:"Start date", endDate:"End date", reset:"Reset", apply:"Apply",
     failureProb: "Failure Probability", predictedIssue: "Predicted Issue", estimatedTime: "Estimated Time", viewDetails: "View Details",
-    avgFleetHealth: "Average Fleet Health", highRiskRobots: "High Severity Robots", predFailures: "Predicted Failures (7d)", modelAccuracy: "Selected Head",
+    avgFleetHealth: "Average Fleet Health", highRiskRobots: "High Severity Robots", predFailures: "Predicted Failures", modelAccuracy: "Selected Head",
     topFailurePred: "Robot-Level Head Outputs",
     riskCritical:"Critical Risk", riskHigh:"High Risk", riskMedium:"Medium Risk", riskLow:"Low Risk",
     allRobots:"All Robots", allComponents:"All Components", allStatuses:"All Statuses", allFaultTypes:"All Fault Types",
@@ -2266,7 +2361,7 @@ const I18N = {
     catNav:"Navigation System", catVacuum:"Vacuum System", catOther:"Other",
     resolved:"Resolved", inProgress:"In Progress",
     head1Label:"Instant Fault Detection", head2Label:"Fault Severity",
-    head3Label:"7-Day Forecast", head4Label:"Fault ETA",
+    head3Label:"Future Forecast", head4Label:"Fault ETA",
     metricAccuracy:"Accuracy", metricAuc:"AUC-ROC", metricMae:"MAE",
   },
   tr: {
@@ -2289,10 +2384,12 @@ const I18N = {
     noRobots:"Robot bulunamadı", noFaults:"Filtrelere uyan arıza yok", noAlerts:"Aktif uyarı yok",
     showing:"Gösteriliyor", to:"-", of:"/", robots:"robot", faults:"arıza",
     notifications: "Bildirimler", markAllRead: "Tümünü okundu say",
-    selectRange: "Tarih Aralığı Seç", last7:"Son 7 gün", last30:"Son 30 gün", last90:"Son 90 gün", allTime:"Tüm zaman",
+    selectRange: "Tarih Aralığı Seç", predictionWindow:"Tahmin Penceresi",
+    last7:"Son 7 gün", last30:"Son 30 gün", last90:"Son 90 gün", allTime:"Tüm zaman",
+    next7Days:"Sonraki 7 Gün", next30Days:"Sonraki 30 Gün", next90Days:"Sonraki 90 Gün",
     startDate:"Başlangıç tarihi", endDate:"Bitiş tarihi", reset:"Sıfırla", apply:"Uygula",
     failureProb: "Arıza Olasılığı", predictedIssue: "Tahmin Edilen Sorun", estimatedTime: "Tahmini Zaman", viewDetails: "Detayları Gör",
-    avgFleetHealth: "Ortalama Filo Sağlığı", highRiskRobots: "Yüksek Şiddetli Robotlar", predFailures: "Tahmini Arızalar (7g)", modelAccuracy: "Seçili Head",
+    avgFleetHealth: "Ortalama Filo Sağlığı", highRiskRobots: "Yüksek Şiddetli Robotlar", predFailures: "Tahmini Arızalar", modelAccuracy: "Seçili Head",
     topFailurePred: "Robot Bazlı Head Çıktıları",
     riskCritical:"Kritik Risk", riskHigh:"Yüksek Risk", riskMedium:"Orta Risk", riskLow:"Düşük Risk",
     allRobots:"Tüm Robotlar", allComponents:"Tüm Bileşenler", allStatuses:"Tüm Durumlar", allFaultTypes:"Tüm Arıza Tipleri",
@@ -2308,7 +2405,7 @@ const I18N = {
     catNav:"Navigasyon Sistemi", catVacuum:"Süpürge/Temizlik", catOther:"Diğer",
     resolved:"Çözüldü", inProgress:"Devam Ediyor",
     head1Label:"Anlık Arıza Tespiti", head2Label:"Arıza Şiddeti",
-    head3Label:"7 Günlük Öngörü", head4Label:"Arıza Süresi",
+    head3Label:"Gelecek Öngörüsü", head4Label:"Arıza Süresi",
     metricAccuracy:"Doğruluk", metricAuc:"AUC-ROC", metricMae:"Ortalama Hata",
   }
 };
@@ -2347,11 +2444,12 @@ function applyLanguage(lang){
   const wf = document.getElementById("predWindowFilter");
   if (wf){
     [...wf.options].forEach(o=>{
-      if (o.value === "7")  o.textContent = t("last7Days");
-      if (o.value === "30") o.textContent = t("last30Days");
-      if (o.value === "90") o.textContent = t("last90Days");
+      if (o.value === "7")  o.textContent = t("next7Days");
+      if (o.value === "30") o.textContent = t("next30Days");
+      if (o.value === "90") o.textContent = t("next90Days");
     });
   }
+  updatePredictionWindowLabel();
   // Category option labels (Brush Motor Issues / Battery & Power / ...)
   const catKeyMap = {
     "Brush Motor Issues":"catBrush","Battery & Power":"catBattery",
@@ -2454,8 +2552,8 @@ async function loadStats(){
   try{
     const d = await fetchJson(`/api/stats${rangeQuery()}`);
     setStatCard("active", d.active_robots, tf("ofNRobots", d.active_robots.total));
-    setStatCard("critical", d.critical_alerts, "robots require attention");
-    setStatCard("fleet", d.fleet_health, "healthy robots", true);
+    setStatCard("critical", d.critical_alerts, t("requireAttention"));
+    setStatCard("fleet", d.fleet_health, t("healthyRobots"), true);
     if (d.range?.start && d.range?.end){
       if (!state.range.extentStart){ state.range.extentStart = d.range.start; state.range.extentEnd = d.range.end; }
       updateDateLabel(d.range.start, d.range.end);
@@ -2474,10 +2572,24 @@ function updateDateLabel(startIso, endIso){
   const label = state.range.start || state.range.end
     ? `${state.range.start || formatRange(startIso)} - ${state.range.end || formatRange(endIso)}`
     : `${formatRange(startIso)} - ${formatRange(endIso)}`;
-  ["dateRange","fhDateRange","predDateRange"].forEach(id=>{
+  ["dateRange","fhDateRange"].forEach(id=>{
     const el = document.getElementById(id);
     if (el) el.textContent = label + " ▾";
   });
+  updatePredictionWindowLabel();
+}
+
+function predictionWindowText(days){
+  const n = Number(days) || 7;
+  if (n === 7) return t("next7Days");
+  if (n === 30) return t("next30Days");
+  if (n === 90) return t("next90Days");
+  return currentLang === "tr" ? `Sonraki ${n} Gün` : `Next ${n} Days`;
+}
+
+function updatePredictionWindowLabel(){
+  const btn = document.getElementById("predDateRange");
+  if (btn) btn.textContent = predictionWindowText(state.pred.windowDays) + " ▾";
 }
 
 async function loadRuntime(){
@@ -2490,25 +2602,37 @@ async function loadRuntime(){
   }
 }
 function renderRuntime(d){
-  const source = d.engine_available ? 'LSTM V2 inference' : 'Dataset target replay';
+  const source = d.engine_kind === 'lstm_v2_inference'
+    ? 'LSTM V2 inference'
+    : (d.engine_kind === 'local_head_model' ? 'Local head model' : 'Dataset target replay');
   const short = d.git_commit ? d.git_commit.slice(0,10) : 'unavailable';
   const weightCls = d.weights_available ? 'good' : 'warn';
+  const artifact = d.weights_available ? 'artifacts present' : 'artifacts missing';
   document.getElementById('runtimeStrip').innerHTML = `
     <div class="runtime-item"><div class="k">Model repo</div><div class="v" title="${escapeAttr(d.repo_url)}">${escapeHtml(d.repo_url)}</div></div>
     <div class="runtime-item"><div class="k">Commit</div><div class="v code">${escapeHtml(short)}</div></div>
-    <div class="runtime-item ${weightCls}"><div class="k">Model artifacts</div><div class="v">${d.weights_available?'weights present':'weights missing'}</div></div>
+    <div class="runtime-item ${weightCls}"><div class="k">Model artifacts</div><div class="v">${artifact}</div></div>
     <div class="runtime-item"><div class="k">Prediction source</div><div class="v">${source}</div></div>`;
 }
 
+const STAT_CARD_IDS = {
+  active:   {value:"activeRobotsValue", sub:"activeRobotsSub", trend:"activeRobotsTrend", bar:"activeRobotsBar"},
+  critical: {value:"criticalValue", sub:null, trend:"criticalTrend", bar:"criticalBar"},
+  fleet:    {value:"fleetValue", sub:null, trend:"fleetTrend", bar:"fleetBar"},
+};
 function setStatCard(prefix, data, subText, percent=false){
+  const ids = STAT_CARD_IDS[prefix] || {
+    value: prefix + "Value", sub: prefix + "Sub", trend: prefix + "Trend", bar: prefix + "Bar",
+  };
   const value = data?.value ?? 0;
   const display = percent ? `${Number(value).toFixed(1)}%` : value;
-  document.getElementById(prefix + "Value").textContent = display;
-  const sub = document.getElementById(prefix + "Sub");
+  const valueEl = document.getElementById(ids.value);
+  if (valueEl) valueEl.textContent = display;
+  const sub = ids.sub ? document.getElementById(ids.sub) : null;
   if (sub) sub.textContent = subText;
-  const bar = document.getElementById(prefix + "Bar");
+  const bar = document.getElementById(ids.bar);
   if (bar) bar.style.width = `${Math.max(0, Math.min(100, Number(value) || 0))}%`;
-  renderTrend(prefix + "Trend", data?.delta_pct);
+  renderTrend(ids.trend, data?.delta_pct);
 }
 
 function renderTrend(elId, delta){
@@ -2814,7 +2938,8 @@ function bindPredictionsUI(){
   });
   document.getElementById("predWindowFilter").addEventListener("change", e=>{
     state.pred.windowDays = parseInt(e.target.value, 10) || 7;
-    loadHeatmap(); loadPredStats(); loadTopFailures();
+    updatePredictionWindowLabel();
+    loadHeatmap(); loadDegradation(); loadPredStats(); loadTopFailures();
   });
   document.getElementById("modelHeadSelect").addEventListener("change", e=>{
     state.pred.head = e.target.value;
@@ -2824,6 +2949,7 @@ function bindPredictionsUI(){
 }
 
 async function loadPredictions(){
+  updatePredictionWindowLabel();
   await Promise.all([loadFilterOptions(), loadHeatmap(), loadDegradation(), loadPredStats(), loadTopFailures()]);
 }
 
@@ -2877,8 +3003,6 @@ async function loadDegradation(){
     if (state.pred.category) params.set("category", state.pred.category);
     if (state.pred.robot) params.set("robot_id", state.pred.robot);
     if (state.pred.windowDays) params.set("days", state.pred.windowDays);
-    if (state.range.start) params.set("start_date", state.range.start);
-    if (state.range.end) params.set("end_date", state.range.end);
     const d = await fetchJson(`/api/predictions/degradation?${params}`);
     renderDegradation("lstmChart", "lstmBadge", d, "#3b82f6", false);
   }catch(e){ console.error(e); }
@@ -2912,8 +3036,6 @@ async function loadPredStats(){
   try{
     const params = new URLSearchParams({days: state.pred.windowDays || 7});
     if (state.pred.robot) params.set("robot_id", state.pred.robot);
-    if (state.range.start) params.set("start_date", state.range.start);
-    if (state.range.end) params.set("end_date", state.range.end);
     const d = await fetchJson(`/api/predictions/stats?${params}`);
     setPredCard("predFleet","predFleetTrend","predFleetBar", d.fleet_health.value+"%", d.fleet_health.delta_pct, d.fleet_health.value);
     setPredCard("predHighRisk","predHighRiskTrend","predHighRiskBar", d.high_risk.value, d.high_risk.delta_pct, Math.min(100, d.high_risk.value*12));
@@ -2951,8 +3073,6 @@ async function loadTopFailures(){
     const params = new URLSearchParams({ days: state.pred.windowDays || 30 });
     if (state.pred.robot) params.set("robot_id", state.pred.robot);
     if (state.pred.head) params.set("head", state.pred.head);
-    if (state.range.start) params.set("start_date", state.range.start);
-    if (state.range.end) params.set("end_date", state.range.end);
     const selCat = document.getElementById("predCategoryFilter")?.value;
     if (selCat) params.set("category", selCat);
     const d = await fetchJson(`/api/predictions/top-failures?${params}`);
@@ -3070,6 +3190,19 @@ function toggleDatePicker(ev, triggerId){
   const pop = document.getElementById("datePopover");
   if (!pop.hidden){ pop.hidden = true; return; }
   closeNotifPanel();
+  const predictionMode = triggerId === "predDateRange";
+  const title = pop.querySelector("h4");
+  if (title) title.textContent = predictionMode ? t("predictionWindow") : t("selectRange");
+  pop.querySelectorAll(".future-range").forEach(el => { el.style.display = predictionMode ? "block" : "none"; });
+  pop.querySelectorAll(".past-range").forEach(el => {
+    if (predictionMode) {
+      el.style.display = "none";
+    } else if (el.classList.contains("row") || el.classList.contains("actions")) {
+      el.style.display = "flex";
+    } else {
+      el.style.display = "block";
+    }
+  });
   // Position the popover under the trigger button
   const btn = document.getElementById(triggerId);
   const r = btn.getBoundingClientRect();
@@ -3114,6 +3247,15 @@ function applyQuickRange(value){
   }
   closeDatePicker();
   reloadCurrentPage();
+}
+
+function applyFutureRange(days){
+  state.pred.windowDays = Number(days) || 7;
+  const wf = document.getElementById("predWindowFilter");
+  if (wf) wf.value = String(state.pred.windowDays);
+  closeDatePicker();
+  updatePredictionWindowLabel();
+  loadPredictions();
 }
 
 function reloadCurrentPage(){

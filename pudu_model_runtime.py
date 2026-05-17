@@ -14,12 +14,13 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from pudu_local_head_model import LocalHeadModelEngine, LocalModelContract, default_artifact_dir
 
 log = logging.getLogger("dashboard.model_runtime")
 
@@ -46,9 +47,14 @@ class RuntimeSnapshot:
     git_commit: str | None = None
     checked_out_at: str | None = None
     error: str | None = None
+    repo_update_error: str | None = None
     weights_available: bool = False
     engine_available: bool = False
+    engine_kind: str | None = None
     engine_error: str | None = None
+    artifact_source: str | None = None
+    artifact_path: str | None = None
+    supported_horizon_hours: list[int] = field(default_factory=list)
     future_window_hours: int | None = None
     feature_columns: list[str] = field(default_factory=list)
     failure_levels: list[str] = field(default_factory=list)
@@ -67,9 +73,14 @@ class RuntimeSnapshot:
             "git_commit": self.git_commit,
             "checked_out_at": self.checked_out_at,
             "error": self.error,
+            "repo_update_error": self.repo_update_error,
             "weights_available": self.weights_available,
             "engine_available": self.engine_available,
+            "engine_kind": self.engine_kind,
             "engine_error": self.engine_error,
+            "artifact_source": self.artifact_source,
+            "artifact_path": self.artifact_path,
+            "supported_horizon_hours": self.supported_horizon_hours,
             "future_window_hours": self.future_window_hours,
             "feature_columns": self.feature_columns,
             "failure_levels": self.failure_levels,
@@ -89,10 +100,10 @@ class PuduModelRuntime:
         self.repo_url = repo_url or os.getenv("PUDU_MODEL_REPO_URL", DEFAULT_MODEL_REPO_URL)
         self.repo_ref = repo_ref or os.getenv("PUDU_MODEL_REPO_REF", DEFAULT_MODEL_REPO_REF)
         self._lock = threading.RLock()
-        self._tempdir: tempfile.TemporaryDirectory[str] | None = None
         self._snapshot: RuntimeSnapshot | None = None
         self._error_category_map: dict[str, int] = {}
         self._engine: Any | None = None
+        self._repo_update_error: str | None = None
 
     def ensure_loaded(self) -> RuntimeSnapshot:
         with self._lock:
@@ -136,12 +147,20 @@ class PuduModelRuntime:
         robot_id: str,
         rows: list[dict[str, Any]],
         reference: datetime,
+        horizon_hours: int | None = None,
     ) -> dict[str, Any] | None:
         """Run the external inference engine when trained artifacts are available."""
         self.ensure_loaded()
         if self._engine is None or not rows:
             return None
         try:
+            if isinstance(self._engine, LocalHeadModelEngine):
+                return self._engine.predict_for_robot(
+                    robot_id=robot_id,
+                    rows=rows,
+                    reference=reference,
+                    horizon_hours=horizon_hours,
+                )
             import pandas as pd
 
             df = pd.DataFrame(rows)
@@ -166,8 +185,7 @@ class PuduModelRuntime:
             )
 
         try:
-            self._tempdir = tempfile.TemporaryDirectory(prefix="pudu_model_repo_")
-            repo_path = Path(self._tempdir.name) / "repo"
+            repo_path = _repo_cache_dir()
             self._clone_repo(repo_path)
             commit = self._git_commit(repo_path)
 
@@ -179,6 +197,7 @@ class PuduModelRuntime:
                     "SEVERITY_MAP",
                     "ERROR_CATEGORY_MAP",
                     "ERROR_CATEGORY_LABELS",
+                    "PRODUCT_MAP",
                 },
             )
             model_literals = _read_assignments(
@@ -190,8 +209,19 @@ class PuduModelRuntime:
             self._error_category_map = dict(inference_literals.get("ERROR_CATEGORY_MAP") or {})
             future_window = _future_window(config_literals, model_literals)
             metrics = _parse_readme_metrics(repo_path / "README.md")
-            weights_available = _has_v2_weights(repo_path)
-            engine_available, engine_error = self._try_prepare_engine(repo_path, weights_available)
+            v2_weights_available = _has_v2_weights(repo_path)
+            engine_available, engine_error, engine_kind, artifact_source, artifact_path, supported_horizons = self._try_prepare_engine(
+                repo_path=repo_path,
+                v2_weights_available=v2_weights_available,
+                feature_columns=list(inference_literals.get("FEATURE_COLUMNS") or []),
+                failure_levels=sorted(inference_literals.get("FAILURE_LEVELS") or []),
+                severity_map=dict(inference_literals.get("SEVERITY_MAP") or {}),
+                severity_labels=_int_keyed(model_literals.get("SEVERITY_LABELS")),
+                severity_labels_tr=_int_keyed(model_literals.get("SEVERITY_LABELS_TR")),
+                error_category_map=self._error_category_map,
+                product_map=dict(inference_literals.get("PRODUCT_MAP") or {}),
+            )
+            artifacts_available = v2_weights_available or bool(artifact_path)
 
             return RuntimeSnapshot(
                 status="ready",
@@ -200,9 +230,14 @@ class PuduModelRuntime:
                 repo_path=str(repo_path),
                 git_commit=commit,
                 checked_out_at=checked_out_at,
-                weights_available=weights_available,
+                repo_update_error=self._repo_update_error,
+                weights_available=artifacts_available,
                 engine_available=engine_available,
+                engine_kind=engine_kind,
                 engine_error=engine_error,
+                artifact_source=artifact_source,
+                artifact_path=artifact_path,
+                supported_horizon_hours=supported_horizons,
                 future_window_hours=future_window,
                 feature_columns=list(inference_literals.get("FEATURE_COLUMNS") or []),
                 failure_levels=sorted(inference_literals.get("FAILURE_LEVELS") or []),
@@ -223,13 +258,41 @@ class PuduModelRuntime:
             )
 
     def _clone_repo(self, repo_path: Path) -> None:
+        timeout = _git_timeout_seconds()
+        repo_path.parent.mkdir(parents=True, exist_ok=True)
+        if (repo_path / ".git").exists():
+            fetch = subprocess.run(
+                ["git", "-C", str(repo_path), "fetch", "--depth", "1", "origin", self.repo_ref],
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+            if fetch.returncode == 0:
+                checkout = subprocess.run(
+                    ["git", "-C", str(repo_path), "checkout", "--force", "FETCH_HEAD"],
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+                if checkout.returncode == 0:
+                    self._repo_update_error = None
+                    return
+                self._repo_update_error = (checkout.stderr or checkout.stdout or "git checkout failed").strip()
+            else:
+                self._repo_update_error = (fetch.stderr or fetch.stdout or "git fetch failed").strip()
+            if (repo_path / "lstm_inference_v2.py").exists():
+                log.warning("Using cached model repository after update failure: %s", self._repo_update_error)
+                return
+            shutil.rmtree(repo_path, ignore_errors=True)
+
         cmd = ["git", "clone", "--depth", "1"]
         if self.repo_ref:
             cmd += ["--branch", self.repo_ref]
         cmd += [self.repo_url, str(repo_path)]
-        result = subprocess.run(cmd, text=True, capture_output=True, timeout=60)
+        result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
         if result.returncode != 0:
             raise RuntimeError((result.stderr or result.stdout or "git clone failed").strip())
+        self._repo_update_error = None
 
     @staticmethod
     def _git_commit(repo_path: Path) -> str | None:
@@ -241,9 +304,28 @@ class PuduModelRuntime:
         )
         return result.stdout.strip() if result.returncode == 0 else None
 
-    def _try_prepare_engine(self, repo_path: Path, weights_available: bool) -> tuple[bool, str | None]:
-        if not weights_available:
-            return False, "V2 model weights are not present in the cloned repository"
+    def _try_prepare_engine(
+        self,
+        repo_path: Path,
+        v2_weights_available: bool,
+        feature_columns: list[str],
+        failure_levels: list[str],
+        severity_map: dict[str, int],
+        severity_labels: dict[int, str],
+        severity_labels_tr: dict[int, str],
+        error_category_map: dict[str, int],
+        product_map: dict[str, int],
+    ) -> tuple[bool, str | None, str | None, str | None, str | None, list[int]]:
+        if not v2_weights_available:
+            return self._try_prepare_local_engine(
+                feature_columns=feature_columns,
+                failure_levels=failure_levels,
+                severity_map=severity_map,
+                severity_labels=severity_labels,
+                severity_labels_tr=severity_labels_tr,
+                error_category_map=error_category_map,
+                product_map=product_map,
+            )
         try:
             import importlib.util
             import sys
@@ -251,7 +333,7 @@ class PuduModelRuntime:
             module_path = repo_path / "lstm_inference_v2.py"
             spec = importlib.util.spec_from_file_location("pudu_lstm_inference_v2_runtime", module_path)
             if spec is None or spec.loader is None:
-                return False, "Could not load lstm_inference_v2.py"
+                return False, "Could not load lstm_inference_v2.py", None, None, None, []
             module = importlib.util.module_from_spec(spec)
             sys.path.insert(0, str(repo_path))
             try:
@@ -262,10 +344,55 @@ class PuduModelRuntime:
                     sys.path.remove(str(repo_path))
                 except ValueError:
                     pass
-            return True, None
+            supported = [int(self._engine.future_window)] if getattr(self._engine, "future_window", None) else []
+            return True, None, "lstm_v2_inference", "github:lstm_v2", str(repo_path / "models" / "lstm_v2"), supported
         except Exception as exc:
             self._engine = None
-            return False, str(exc)
+            return False, str(exc), None, "github:lstm_v2", str(repo_path / "models" / "lstm_v2"), []
+
+    def _try_prepare_local_engine(
+        self,
+        feature_columns: list[str],
+        failure_levels: list[str],
+        severity_map: dict[str, int],
+        severity_labels: dict[int, str],
+        severity_labels_tr: dict[int, str],
+        error_category_map: dict[str, int],
+        product_map: dict[str, int],
+    ) -> tuple[bool, str | None, str | None, str | None, str | None, list[int]]:
+        if not feature_columns:
+            return False, "V2 weights are absent and the source feature contract could not be parsed", None, None, None, []
+        try:
+            contract = LocalModelContract(
+                feature_columns=feature_columns,
+                failure_levels=failure_levels,
+                severity_map=severity_map,
+                severity_labels=severity_labels,
+                severity_labels_tr=severity_labels_tr,
+                error_category_map=error_category_map,
+                product_map=product_map,
+            )
+            engine = LocalHeadModelEngine.prepare(default_artifact_dir(), contract)
+            self._engine = engine
+            return (
+                True,
+                None,
+                "local_head_model",
+                "huggingface:training_split",
+                str(engine.artifact_path),
+                engine.supported_horizon_hours,
+            )
+        except Exception as exc:
+            self._engine = None
+            return (
+                False,
+                "V2 model weights are not present in the cloned repository; local artifact generation failed: "
+                + str(exc),
+                None,
+                None,
+                None,
+                [],
+            )
 
 
 def _read_assignments(path: Path, names: set[str]) -> dict[str, Any]:
@@ -295,6 +422,21 @@ def _int_keyed(value: Any) -> dict[int, str]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+def _repo_cache_dir() -> Path:
+    configured = os.getenv("PUDU_MODEL_REPO_CACHE_DIR")
+    if configured:
+        return Path(configured)
+    cache_root = Path(os.getenv("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache_root / "pudu-dashboard" / "model_repo" / "pudu_bot_model_training"
+
+
+def _git_timeout_seconds() -> int:
+    try:
+        return max(30, int(os.getenv("PUDU_MODEL_GIT_TIMEOUT_SECONDS", "180")))
+    except ValueError:
+        return 180
 
 
 def _future_window(config_literals: dict[str, Any], model_literals: dict[str, Any]) -> int | None:
