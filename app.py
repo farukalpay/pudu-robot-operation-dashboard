@@ -261,6 +261,28 @@ def _category_for_error_type(error_type: str | None) -> str:
 
 CATEGORY_ORDER = ["Brush Motor Issues", "Battery & Power", "Navigation System", "Vacuum System", "Other"]
 
+# DrGb24 V2 multi-output LSTM metrics, lifted verbatim from
+# https://github.com/DrGb24/pudu_bot_model_training README. The HuggingFace
+# training_runs row still describes the legacy lstm_partitioned model so the
+# dashboard prefers these published V2 numbers for the "Model Accuracy" KPI
+# and the Model Performance view.
+DRGB24_V2_METRICS = {
+    # Head 1 - Anlik ariza tespiti (binary)
+    "head1_instant_fault": {"accuracy": 0.994, "f1": 0.948, "auc_roc": 0.999},
+    # Head 2 - Ariza siddeti (4-class: Event/Warning/Error/Fatal)
+    "head2_severity":      {"accuracy": 0.986},
+    # Head 3 - 7 gunluk ariza olasiligi (regression 0-1)
+    "head3_seven_day":     {"auc_roc": 0.805},
+    # Head 4 - Tahmini ariza suresi (regression 0-168 saat)
+    "head4_fault_eta":     {"mae_hours": 19.7},
+    # Primary "Model Accuracy" surfaced on the Predictions KPI card
+    "primary_accuracy":    0.994,
+    "model_name":          "lstm_v2_multi_output",
+    "training_dataset":    "Lightcap/pudu-robot-operation-logs-bau-capstone-2026",
+    "training_rows":       147488,
+    "source":              "https://github.com/DrGb24/pudu_bot_model_training",
+}
+
 
 # ============================================================================
 # API: shared
@@ -558,18 +580,20 @@ def api_fault_frequency(start_date: str | None = None, end_date: str | None = No
             WHERE task_time BETWEEN %s AND %s
             GROUP BY 1, 2 ORDER BY 1;
         """, (start, end))
+        # Return month buckets as ISO timestamps so the frontend can format
+        # them with the user's chosen locale (Feb / Şub etc).
         agg: dict[str, dict[str, int]] = {}
         order_keys: list[str] = []
         for r in cur.fetchall():
-            label = r["bkt"].strftime("%b %Y")
-            if label not in agg:
-                agg[label] = {c: 0 for c in CATEGORY_ORDER}
-                order_keys.append(label)
+            iso = r["bkt"].isoformat()
+            if iso not in agg:
+                agg[iso] = {c: 0 for c in CATEGORY_ORDER}
+                order_keys.append(iso)
             cat = _category_for_error_type(r["etype"])
-            agg[label][cat] += int(r["cnt"])
-        labels = order_keys[-6:]
-        datasets = [{"label": cat, "data": [agg.get(l, {}).get(cat, 0) for l in labels]} for cat in CATEGORY_ORDER]
-        return {"labels": labels, "datasets": datasets}
+            agg[iso][cat] += int(r["cnt"])
+        labels_iso = order_keys[-6:]
+        datasets = [{"label": cat, "data": [agg.get(l, {}).get(cat, 0) for l in labels_iso]} for cat in CATEGORY_ORDER]
+        return {"labels_iso": labels_iso, "datasets": datasets}
 
 
 @app.get("/api/fault-history/list")
@@ -797,13 +821,22 @@ def api_pred_stats(days: int = Query(7, ge=1, le=365)) -> dict[str, Any]:
         """, (prev_start, recent_start))
         pred_fail_prev = cur.fetchone()["n"] or 0
 
-        cur.execute("SELECT metrics FROM model_training.training_runs ORDER BY created_at DESC LIMIT 1;")
-        row = cur.fetchone()
-        accuracy = 0.0
-        if row and row["metrics"]:
-            metrics = _json_value(row["metrics"])
-            if isinstance(metrics, dict):
-                accuracy = round(float(metrics.get("accuracy", 0)) * 100, 1)
+        # Primary "Model Accuracy" KPI reflects DrGb24 V2 Head 1 (instant-fault
+        # detection), not the legacy lstm_partitioned accuracy recorded in
+        # model_training.training_runs.
+        accuracy = round(DRGB24_V2_METRICS["primary_accuracy"] * 100, 1)
+        # All four head metrics so the client can switch between them via a
+        # small dropdown on the Model Accuracy KPI card.
+        model_heads = {
+            "1": {"value": round(DRGB24_V2_METRICS["head1_instant_fault"]["accuracy"] * 100, 1),
+                  "unit": "%", "label_key": "head1Label", "metric_key": "metricAccuracy"},
+            "2": {"value": round(DRGB24_V2_METRICS["head2_severity"]["accuracy"] * 100, 1),
+                  "unit": "%", "label_key": "head2Label", "metric_key": "metricAccuracy"},
+            "3": {"value": round(DRGB24_V2_METRICS["head3_seven_day"]["auc_roc"] * 100, 1),
+                  "unit": "%", "label_key": "head3Label", "metric_key": "metricAuc"},
+            "4": {"value": DRGB24_V2_METRICS["head4_fault_eta"]["mae_hours"],
+                  "unit": "h", "label_key": "head4Label", "metric_key": "metricMae"},
+        }
 
         def pct(now_v: float, prev_v: float) -> float:
             return 0.0 if prev_v == 0 else round((now_v - prev_v) / prev_v * 100, 1)
@@ -813,6 +846,7 @@ def api_pred_stats(days: int = Query(7, ge=1, le=365)) -> dict[str, Any]:
             "high_risk":      {"value": high_risk,           "delta_pct": pct(high_risk, high_risk_prev)},
             "predicted_fail": {"value": pred_fail,           "delta_pct": pct(pred_fail, pred_fail_prev)},
             "model_accuracy": {"value": accuracy,            "delta_pct": 1.8},
+            "model_heads":    model_heads,
         }
 
 
@@ -1064,11 +1098,13 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
 .heatmap.cols .hcell .fill{position:absolute;inset:0;border-radius:5px;z-index:1}
 .heatmap.cols .rlabel{font-size:12px;font-weight:600;color:var(--text);
   padding-right:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.heatmap.cols .hlabel{font-size:10.5px;color:var(--text-mute);text-align:center;
-  font-variant-numeric:tabular-nums;white-space:nowrap;padding:14px 2px 0;position:relative}
-/* Tick line going UP from the foot label, sitting between cells visually */
+.heatmap.cols .hlabel{font-size:10.5px;color:var(--text-mute);text-align:left;
+  font-variant-numeric:tabular-nums;white-space:nowrap;padding:14px 0 0;position:relative}
+/* Tick line going UP from the foot label, anchored at the LEFT edge of each
+   grid cell. This shifts the date label + its tick a hair to the left of the
+   bar above it without moving the bars themselves. */
 .heatmap.cols .hrow.foot .hlabel::before{
-  content:"";position:absolute;left:50%;bottom:100%;transform:translateX(-50%);
+  content:"";position:absolute;left:0;bottom:100%;
   width:1px;height:10px;background:var(--text-mute);opacity:.6;
 }
 .heatmap.cols .hrow.foot{margin-top:2px}
@@ -1110,7 +1146,14 @@ body.dark .stat-title{color:var(--text-mute)}
 .icon-purple{background:var(--purple-soft);color:var(--purple)}
 .icon-amber{background:var(--amber-soft);color:var(--amber)}
 .stat-body{min-width:0}
-.stat-title{font-size:13px;color:var(--text-mute);font-weight:600;margin-bottom:4px}
+.stat-title{font-size:13px;color:var(--text-mute);font-weight:600;margin-bottom:4px;
+  display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.head-select{margin-left:auto;border:1px solid var(--border);background:#fff;
+  font-size:11px;color:var(--text);border-radius:6px;padding:2px 18px 2px 6px;
+  appearance:none;cursor:pointer;font-family:inherit;font-weight:600;
+  background-image:url("data:image/svg+xml;utf8,<svg fill='none' stroke='%236b7280' stroke-width='2' viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'><polyline points='6 9 12 15 18 9'/></svg>");
+  background-repeat:no-repeat;background-position:right 4px center;background-size:10px}
+body.dark .head-select{background-color:#172238;color:var(--text);border-color:var(--border)}
 .stat-value{font-size:30px;font-weight:700;line-height:1.1}
 .stat-sub{font-size:12px;color:var(--text-mute);margin-top:2px}
 .stat-trend{text-align:right}
@@ -1626,7 +1669,19 @@ table.data tbody tr:last-child td{border-bottom:none}
         </div>
         <div class="card stat">
           <div class="stat-icon icon-purple"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M8 12l2.5 2.5L16 9"></path></svg></div>
-          <div class="stat-body"><div class="stat-title" data-i18n="modelAccuracy">Model Accuracy</div><div class="stat-value" id="predAcc">—%</div></div>
+          <div class="stat-body">
+            <div class="stat-title">
+              <span data-i18n="modelAccuracy">Model Accuracy</span>
+              <select class="head-select" id="modelHeadSelect">
+                <option value="1">Head 1</option>
+                <option value="2">Head 2</option>
+                <option value="3">Head 3</option>
+                <option value="4">Head 4</option>
+              </select>
+            </div>
+            <div class="stat-value" id="predAcc">—%</div>
+            <div class="stat-sub" id="predHeadHint"></div>
+          </div>
           <div class="stat-trend" id="predAccTrend"></div>
           <div class="stat-bar"><div class="stat-bar-fill purple" id="predAccBar" style="width:0%"></div></div>
         </div>
@@ -1720,6 +1775,9 @@ const I18N = {
     catBrush:"Brush Motor Issues", catBattery:"Battery & Power",
     catNav:"Navigation System", catVacuum:"Vacuum System", catOther:"Other",
     resolved:"Resolved", inProgress:"In Progress",
+    head1Label:"Instant Fault Detection", head2Label:"Fault Severity",
+    head3Label:"7-Day Forecast", head4Label:"Fault ETA",
+    metricAccuracy:"Accuracy", metricAuc:"AUC-ROC", metricMae:"MAE",
   },
   tr: {
     navDashboard: "Gösterge Paneli", navPredictions: "Tahminler & Analiz", navFaultHistory: "Arıza Geçmişi",
@@ -1759,6 +1817,9 @@ const I18N = {
     catBrush:"Fırça/Motor Sorunları", catBattery:"Pil & Güç",
     catNav:"Navigasyon Sistemi", catVacuum:"Süpürge/Temizlik", catOther:"Diğer",
     resolved:"Çözüldü", inProgress:"Devam Ediyor",
+    head1Label:"Anlık Arıza Tespiti", head2Label:"Arıza Şiddeti",
+    head3Label:"7 Günlük Öngörü", head4Label:"Arıza Süresi",
+    metricAccuracy:"Doğruluk", metricAuc:"AUC-ROC", metricMae:"Ortalama Hata",
   }
 };
 let currentLang = localStorage.getItem("lang") || "en";
@@ -1813,6 +1874,16 @@ function applyLanguage(lang){
       if (k) o.textContent = t(k);
     });
   });
+  // Model head select: "Head 1 · Anlık Arıza Tespiti" etc.
+  const mhs = document.getElementById("modelHeadSelect");
+  if (mhs){
+    [...mhs.options].forEach(o=>{
+      const key = "head"+o.value+"Label";
+      o.textContent = `Head ${o.value} · ${t(key)}`;
+    });
+  }
+  // Re-render the model head card so the hint (label · metric) follows the lang.
+  if (state && state.pred && state.pred.heads) renderModelHeadCard();
 }
 function setLanguage(lang){ applyLanguage(lang); reloadCurrentPage(); refreshNotificationBadge(); }
 function applyTheme(theme){
@@ -1836,7 +1907,7 @@ const CAT_COLORS = {
 const state = {
   page:1, pageSize:5, search:"", status:"All Statuses", faultType:"All Fault Types",
   fh:{page:1, pageSize:8, search:"", robot:"All Robots", fault_type:"All Fault Types", status:"All Statuses", start_date:"", end_date:""},
-  pred:{category:"Brush Motor Issues", robot:"All Robots", windowDays:7},
+  pred:{category:"Brush Motor Issues", robot:"All Robots", windowDays:7, head:"1", heads:null},
   // global date filter shared across dashboard/predictions/fault-history
   range:{ start:"", end:"", extentStart:"", extentEnd:"" },
   notifications:{ items:[], dismissedAt:null },
@@ -2147,12 +2218,17 @@ async function loadFaultHistory(){
 async function loadFhFrequency(){
   try{
     const d = await fetchJson(`/api/fault-history/frequency${rangeQuery()}`);
+    // Format the month labels using the active locale so months render
+    // as "Şub 2026" in TR and "Feb 2026" in EN.
+    const labels = (d.labels_iso || d.labels || []).map(iso =>
+      new Date(iso).toLocaleDateString(locale(), {month:"short", year:"numeric"})
+    );
     const datasets = d.datasets.map(ds=>({label:ds.label, data:ds.data,
       backgroundColor: CAT_COLORS[ds.label] || "#94a3b8", borderRadius:4}));
     const ctx = document.getElementById("freqChart").getContext("2d");
     charts.freqChart?.destroy();
     charts.freqChart = new Chart(ctx, {
-      type:"bar", data:{labels:d.labels, datasets},
+      type:"bar", data:{labels, datasets},
       options:{ responsive:true, maintainAspectRatio:false,
         plugins:{legend:{display:false}},
         scales:{ x:{stacked:true, grid:{display:false}, ticks:{color:"#94a3b8"}},
@@ -2234,6 +2310,10 @@ function bindPredictionsUI(){
   document.getElementById("predWindowFilter").addEventListener("change", e=>{
     state.pred.windowDays = parseInt(e.target.value, 10) || 7;
     loadHeatmap(); loadPredStats(); loadTopFailures();
+  });
+  document.getElementById("modelHeadSelect").addEventListener("change", e=>{
+    state.pred.head = e.target.value;
+    renderModelHeadCard();
   });
 }
 
@@ -2322,8 +2402,27 @@ async function loadPredStats(){
     setPredCard("predFleet","predFleetTrend","predFleetBar", d.fleet_health.value+"%", d.fleet_health.delta_pct, d.fleet_health.value);
     setPredCard("predHighRisk","predHighRiskTrend","predHighRiskBar", d.high_risk.value, d.high_risk.delta_pct, Math.min(100, d.high_risk.value*12));
     setPredCard("predFail","predFailTrend","predFailBar", d.predicted_fail.value, d.predicted_fail.delta_pct, Math.min(100, d.predicted_fail.value*12));
-    setPredCard("predAcc","predAccTrend","predAccBar", d.model_accuracy.value+"%", d.model_accuracy.delta_pct, d.model_accuracy.value);
+    state.pred.heads = d.model_heads || null;
+    renderModelHeadCard();
   }catch(e){ console.error(e); }
+}
+
+function renderModelHeadCard(){
+  const heads = state.pred.heads;
+  if (!heads){
+    setPredCard("predAcc","predAccTrend","predAccBar", "—", 0, 0);
+    return;
+  }
+  const cur = heads[state.pred.head] || heads["1"];
+  const display = cur.unit === "%" ? `${cur.value}%` : `${cur.value}${cur.unit}`;
+  const barPct = cur.unit === "%" ? cur.value : Math.max(0, 100 - Math.min(100, cur.value * 0.6));
+  setPredCard("predAcc","predAccTrend","predAccBar", display, 1.8, barPct);
+  const hint = document.getElementById("predHeadHint");
+  if (hint){
+    const metric = t(cur.metric_key) || cur.metric_key;
+    const label = t(cur.label_key) || cur.label_key;
+    hint.textContent = `${label} · ${metric}`;
+  }
 }
 
 function setPredCard(valId, trendId, barId, val, delta, barPct){
