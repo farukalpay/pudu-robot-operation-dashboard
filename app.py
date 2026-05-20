@@ -1206,23 +1206,38 @@ def _engine_history_by_robot(
 ) -> dict[str, list[dict[str, Any]]]:
     if not robot_ids:
         return {}
+    history_limit = _model_history_rows_limit()
     placeholders = ",".join(["%s"] * len(robot_ids))
     cur.execute(
         f"""
+        WITH ranked AS (
+            SELECT robot_id, product_code, soft_version, error_type, error_level,
+                   hourly_ratio, hourly_error_count, task_time,
+                   date_trunc('hour', task_time) AS task_hour,
+                   ROW_NUMBER() OVER (PARTITION BY robot_id ORDER BY task_time DESC) AS rn
+            FROM public.robot_logs_error
+            WHERE task_time BETWEEN %s AND %s
+              AND robot_id IN ({placeholders})
+        )
         SELECT robot_id, product_code, soft_version, error_type, error_level,
-               hourly_ratio, hourly_error_count, task_time,
-               date_trunc('hour', task_time) AS task_hour
-        FROM public.robot_logs_error
-        WHERE task_time BETWEEN %s AND %s
-          AND robot_id IN ({placeholders})
+               hourly_ratio, hourly_error_count, task_time, task_hour
+        FROM ranked
+        WHERE rn <= %s
         ORDER BY robot_id, task_time;
         """,
-        [start, reference, *robot_ids],
+        [start, reference, *robot_ids, history_limit],
     )
     by_robot: dict[str, list[dict[str, Any]]] = {}
     for row in cur.fetchall():
         by_robot.setdefault(row["robot_id"], []).append(row)
     return by_robot
+
+
+def _model_history_rows_limit() -> int:
+    try:
+        return max(10, min(240, int(os.getenv("PUDU_MODEL_HISTORY_ROWS", "24"))))
+    except ValueError:
+        return 24
 
 
 def _model_source(snapshot: RuntimeSnapshot) -> str:

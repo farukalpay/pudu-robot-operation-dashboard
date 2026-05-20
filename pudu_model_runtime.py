@@ -31,6 +31,12 @@ log = logging.getLogger("dashboard.model_runtime")
 DEFAULT_MODEL_REPO_URL = "https://github.com/DrGb24/pudu_bot_model_training.git"
 DEFAULT_MODEL_REPO_REF = "main"
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+
 
 @dataclass(frozen=True)
 class ModelHeadMetric:
