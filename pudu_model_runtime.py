@@ -20,7 +20,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
+
 from pudu_local_head_model import LocalHeadModelEngine, LocalModelContract, default_artifact_dir
+
+load_dotenv()
 
 log = logging.getLogger("dashboard.model_runtime")
 

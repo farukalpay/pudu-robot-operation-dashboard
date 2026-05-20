@@ -7,3 +7,5 @@ pandas>=2.2
 numpy>=1.26
 scikit-learn>=1.5
 joblib>=1.4
+tensorflow>=2.16,<2.18; python_version < "3.13"
+openpyxl>=3.1
