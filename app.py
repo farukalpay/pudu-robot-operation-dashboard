@@ -372,6 +372,7 @@ def api_filter_options() -> dict[str, Any]:
         robots = [r["robot_id"] for r in cur.fetchall()]
         categories = ["All Components"] + _category_order_from_types(ftypes)
         return {
+            "robot_statuses": ["All Statuses", "FAULTED", "MAINTENANCE", "MONITOR", "OPERATIONAL"],
             "statuses": ["All Statuses", "Critical", "Warning", "Normal", "Unknown"],
             "fault_types": ["All Fault Types"] + ftypes,
             "robots": ["All Robots"] + robots,
@@ -579,8 +580,7 @@ def api_robots(
             forecast = seven_day.get(r["robot_id"], prob)
             code = _status_code(r["error_level"], prob, forecast)
             severity = _normalize_severity(r["error_level"])
-            legacy_status = _classify_status(r["error_level"], r["hourly_ratio"])
-            if status and status.lower() not in ("all", "all statuses") and legacy_status.lower() != status.lower():
+            if status and status.lower() not in ("all", "all statuses") and status.upper() != code:
                 continue
             # Estimated remaining time before predicted failure (synthetic 0-168h)
             est_hours = max(0, round(168 * max(0.0, 1 - max(prob, forecast)), 0))
@@ -1547,7 +1547,7 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
 .app{display:flex;min-height:100vh;max-width:100vw;overflow-x:hidden}
 .sidebar{width:248px;background:linear-gradient(180deg,var(--sidebar-bg),var(--sidebar-bg-2));
   color:var(--sidebar-fg);display:flex;flex-direction:column;justify-content:space-between;
-  padding:18px 14px;position:sticky;top:0;height:100vh;flex-shrink:0}
+  padding:18px 14px;position:sticky;top:0;bottom:0;overflow-y:auto;flex-shrink:0}
 .brand{display:flex;align-items:center;gap:10px;padding:6px 8px 18px;
   border-bottom:1px solid rgba(255,255,255,.06);margin-bottom:12px}
 .brand-logo{width:38px;height:38px;border-radius:10px;
@@ -2344,10 +2344,11 @@ const I18N = {
     activeRobots: "Active Robots", criticalAlerts: "Critical Fault Alerts", fleetHealth: "Overall Fleet Health",
     healthyRobots: "healthy robots", requireAttention: "robots require attention",
     robotHealth: "Robot Health Overview", searchRobot: "Search robot ID...",
-    colRobot:"Robot", colStatus:"Status", colFault:"Predicted Fault", colSemantic:"Semantic Score",
+    colRobot:"Robot", colStatus:"Status", colFault:"Predicted Fault", colSemantic:"Fault Probability",
     colSeverity:"Severity", colForecast:"7-Day Forecast", colErrors:"Active Errors",
     colLastUpdated:"Last Updated", colAction:"Action",
     statusFAULTED:"Faulted", statusMAINTENANCE:"Needs Maintenance", statusMONITOR:"Monitor", statusOPERATIONAL:"Operational",
+    statusCritical:"Critical", statusWarning:"Warning", statusNormal:"Normal", statusUnknown:"Unknown",
     predictionsTitle: "Predictions & Analysis", predictionsSubtitle: "AI-powered insights and predictive analytics for your robot fleet",
     fleetRiskHeatmap: "Fleet Risk Assessment Heatmap", componentDegradation: "Component Degradation Over Time",
     lstmModelPred: "LSTM Model Prediction", heatHigh:"High", heatLow:"Low",
@@ -2388,10 +2389,11 @@ const I18N = {
     activeRobots: "Aktif Robotlar", criticalAlerts: "Kritik Arıza Uyarıları", fleetHealth: "Genel Filo Sağlığı",
     healthyRobots: "sağlıklı robot", requireAttention: "robot ilgi bekliyor",
     robotHealth: "Robot Sağlık Özeti", searchRobot: "Robot ID ara...",
-    colRobot:"Robot", colStatus:"Durum", colFault:"Tahmin Edilen Arıza", colSemantic:"Semantik Skor",
+    colRobot:"Robot", colStatus:"Durum", colFault:"Tahmin Edilen Arıza", colSemantic:"Arıza Olasılığı",
     colSeverity:"Şiddet", colForecast:"7 Günlük Öngörü", colErrors:"Aktif Hatalar",
     colLastUpdated:"Son Güncelleme", colAction:"İşlem",
     statusFAULTED:"Arızalı", statusMAINTENANCE:"Bakım Gerekli", statusMONITOR:"Takipte", statusOPERATIONAL:"Çalışır Durumda",
+    statusCritical:"Kritik", statusWarning:"Uyarı", statusNormal:"Normal", statusUnknown:"Bilinmeyen",
     predictionsTitle: "Tahminler & Analiz", predictionsSubtitle: "Robot filonuz için yapay zeka destekli öngörüler",
     fleetRiskHeatmap: "Filo Risk Haritası", componentDegradation: "Bileşen Yıpranma Trendi",
     lstmModelPred: "LSTM Model Tahmini", heatHigh:"Yüksek", heatLow:"Düşük",
@@ -2473,6 +2475,32 @@ function applyLanguage(lang){
     "Brush Motor Issues":"catBrush","Battery & Power":"catBattery",
     "Navigation System":"catNav","Vacuum System":"catVacuum","Other":"catOther",
   };
+  const statusCodeMap = {
+    "FAULTED":"statusFAULTED","MAINTENANCE":"statusMAINTENANCE",
+    "MONITOR":"statusMONITOR","OPERATIONAL":"statusOPERATIONAL",
+  };
+  const legacyStatusMap = {
+    "Critical":"statusCritical","Warning":"statusWarning",
+    "Normal":"statusNormal","Unknown":"statusUnknown",
+  };
+  ["statusFilter"].forEach(id=>{
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    [...sel.options].forEach(o=>{
+      if (!o.value) return;
+      const key = statusCodeMap[o.value];
+      if (key) o.textContent = t(key);
+    });
+  });
+  ["fhStatusFilter"].forEach(id=>{
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    [...sel.options].forEach(o=>{
+      if (!o.value) return;
+      const key = legacyStatusMap[o.value];
+      if (key) o.textContent = t(key);
+    });
+  });
   ["degrCategoryFilter","predCategoryFilter"].forEach(id=>{
     const sel = document.getElementById(id);
     if (!sel) return;
@@ -2737,7 +2765,7 @@ async function loadFilterOptions(){
   if (filterOptionsLoaded){ applyLanguage(currentLang); return; }
   try{
     const d = await fetchJson("/api/filter-options");
-    document.getElementById("statusFilter").innerHTML    = asOptions(d.statuses);
+    document.getElementById("statusFilter").innerHTML    = asOptions(d.robot_statuses);
     document.getElementById("faultFilter").innerHTML     = asOptions(d.fault_types);
     document.getElementById("fhRobotFilter").innerHTML   = asOptions(d.robots);
     document.getElementById("fhFaultFilter").innerHTML   = asOptions(d.fault_types);
