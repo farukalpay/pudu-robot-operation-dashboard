@@ -682,7 +682,7 @@ def api_fault_list(
     with get_cursor() as cur:
         win_start, win_end = _data_window(cur)
         sql = """
-            SELECT robot_id, error_type, error_detail, error_level, hourly_ratio, task_time,
+            SELECT robot_id, error_id, error_type, error_detail, error_level, hourly_ratio, task_time,
                    hourly_error_count, pair_max_hourly_count
             FROM public.robot_logs_error
             WHERE task_time BETWEEN %s AND %s
@@ -703,8 +703,9 @@ def api_fault_list(
             except ValueError:
                 pass
         if search:
-            sql += " AND (COALESCE(error_type,'') ILIKE %s OR COALESCE(error_detail,'') ILIKE %s OR COALESCE(robot_id,'') ILIKE %s)"
-            like = f"%{search}%"; params += [like, like, like]
+            # Renamed to "Search robot ID" in the UI: now only matches robot_id.
+            sql += " AND COALESCE(robot_id,'') ILIKE %s"
+            params.append(f"%{search}%")
         if robot and robot.lower() not in ("all", "all robots"):
             sql += " AND robot_id = %s"; params.append(robot)
         if fault_type and fault_type.lower() not in ("all", "all fault types"):
@@ -728,6 +729,7 @@ def api_fault_list(
             items.append({
                 "task_time": r["task_time"].isoformat() if r["task_time"] else None,
                 "robot_id": r["robot_id"] or "",
+                "error_id": r["error_id"] or "",
                 "fault_type_raw": r["error_type"] or "Unknown",
                 "category": _category_for_error_type(r["error_type"]),
                 "diagnosed_issue": r["error_detail"] or r["error_type"] or "Unknown issue",
@@ -1854,6 +1856,11 @@ table.data tbody tr:last-child td{border-bottom:none}
 .status.in-progress::before{background:var(--amber)}
 
 .cat-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}
+.mono-id{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:11.5px;color:var(--text);background:#f1f3f7;border:1px solid var(--border);
+  padding:2px 8px;border-radius:6px;display:inline-block;max-width:140px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:middle}
+body.dark .mono-id{background:#172238;color:var(--text)}
 .fault-name{font-weight:500}
 .fault-detail{font-size:11.5px;color:var(--text-mute);max-width:300px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -2182,11 +2189,10 @@ table.data tbody tr:last-child td{border-bottom:none}
       <div class="filter-row">
         <div class="search" style="flex:1;min-width:180px">
           <span class="search-icon">🔎</span>
-          <input type="search" id="fhSearch" placeholder="Search faults..." data-i18n-ph="searchFaults" />
+          <input type="search" id="fhSearch" placeholder="Search robot ID..." data-i18n-ph="searchRobot" />
         </div>
         <select class="select" id="fhRobotFilter"></select>
         <select class="select" id="fhFaultFilter"></select>
-        <select class="select" id="fhStatusFilter"></select>
         <input class="input-date" type="date" id="fhStartDate" />
         <span class="arrow">→</span>
         <input class="input-date" type="date" id="fhEndDate" />
@@ -2199,13 +2205,14 @@ table.data tbody tr:last-child td{border-bottom:none}
             <thead><tr>
               <th data-i18n="fhColDateTime">Date &amp; Time</th>
               <th data-i18n="fhColRobotId">Robot ID</th>
+              <th data-i18n="fhColErrorId">Error ID</th>
               <th data-i18n="fhColFaultType">Fault Type</th>
               <th data-i18n="fhColDiagnosed">Diagnosed Issue (From Logs)</th>
               <th data-i18n="fhColDowntime">Downtime Duration</th>
               <th data-i18n="fhColResolution">Resolution Status</th>
               <th class="action-col" data-i18n="fhColActions">Actions</th>
             </tr></thead>
-            <tbody id="fhTableBody"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+            <tbody id="fhTableBody"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
           </table>
         </div>
         <div class="table-foot">
@@ -2384,7 +2391,7 @@ const I18N = {
     totalFaults:"Total Faults", ofNRobots:"of {0} total robots",
     showingNofM:"Showing {0} to {1} of {2} {3}",
     sensorTrend:"Sensor Anomaly Trend", faultDist:"Fault Distribution", faultFreq:"Fault Frequency Over Time (Last 6 Months)",
-    fhColDateTime:"Date & Time", fhColRobotId:"Robot ID", fhColFaultType:"Fault Type",
+    fhColDateTime:"Date & Time", fhColRobotId:"Robot ID", fhColErrorId:"Error ID", fhColFaultType:"Fault Type",
     fhColDiagnosed:"Diagnosed Issue (From Logs)", fhColDowntime:"Downtime Duration",
     fhColResolution:"Resolution Status", fhColActions:"Actions",
     clearFilters:"Clear Filters",
@@ -2430,7 +2437,7 @@ const I18N = {
     totalFaults:"Toplam Arıza", ofNRobots:"toplam {0} robottan",
     showingNofM:"{2} {3}, {0}-{1} arası gösteriliyor",
     sensorTrend:"Sensör Anomali Trendi", faultDist:"Arıza Dağılımı", faultFreq:"Zaman İçinde Arıza Sıklığı (Son 6 Ay)",
-    fhColDateTime:"Tarih & Saat", fhColRobotId:"Robot ID", fhColFaultType:"Arıza Tipi",
+    fhColDateTime:"Tarih & Saat", fhColRobotId:"Robot ID", fhColErrorId:"Hata ID", fhColFaultType:"Arıza Tipi",
     fhColDiagnosed:"Teşhis Edilen Sorun (Loglardan)", fhColDowntime:"Duraklama Süresi",
     fhColResolution:"Çözüm Durumu", fhColActions:"İşlemler",
     clearFilters:"Filtreleri Temizle",
@@ -2459,7 +2466,6 @@ function applyLanguage(lang){
   // their literal text.
   const sentinelMap = [
     ["statusFilter", "allStatuses"],
-    ["fhStatusFilter", "allStatuses"],
     ["faultFilter", "allFaultTypes"],
     ["fhFaultFilter", "allFaultTypes"],
     ["fhRobotFilter", "allRobots"],
@@ -2505,15 +2511,6 @@ function applyLanguage(lang){
       if (key) o.textContent = t(key);
     });
   });
-  ["fhStatusFilter"].forEach(id=>{
-    const sel = document.getElementById(id);
-    if (!sel) return;
-    [...sel.options].forEach(o=>{
-      if (!o.value) return;
-      const key = legacyStatusMap[o.value];
-      if (key) o.textContent = t(key);
-    });
-  });
   ["degrCategoryFilter","predCategoryFilter"].forEach(id=>{
     const sel = document.getElementById(id);
     if (!sel) return;
@@ -2549,9 +2546,37 @@ function toggleSettings(ev){
 
 const FAULT_COLORS = ["#3b82f6","#10b981","#f59e0b","#a855f7","#94a3b8"];
 const CAT_COLORS = {
+  // English canonical keys — what the old _category_for_error_type returned.
   "Brush Motor Issues":"#3b82f6","Battery & Power":"#10b981","Navigation System":"#f59e0b",
   "Vacuum System":"#a855f7","Other":"#94a3b8",
+  // Old localized aliases from the previous TR build.
+  "Fırça/Motor Sorunları":"#3b82f6","Pil & Güç":"#10b981","Navigasyon Sistemi":"#f59e0b",
+  "Süpürge/Temizlik":"#a855f7","Diğer":"#94a3b8",
+  // Categories actually emitted by the live backend on the deployed
+  // server (already in Turkish). Each gets a distinct hue so the
+  // stacked bar chart isn't a wall of grey.
+  "Navigasyon":"#3b82f6",         // navigation -> blue
+  "Harita/Durum":"#f59e0b",       // map / localization -> amber
+  "Sensör Kaybı":"#a855f7",       // sensor loss -> purple
+  "Hareket":"#22c55e",            // motion / drive -> green
+  "Temizlik":"#06b6d4",           // cleaning -> cyan
+  "Donanım/İletişim":"#ef4444",   // hw / comm -> red
+  "Güç/Batarya":"#10b981",        // power / battery -> emerald
+  "Bilinmiyor":"#94a3b8",         // unknown -> slate
 };
+// Reverse lookup the canonical category code for a possibly-translated label.
+function canonicalCategory(label){
+  const m = {
+    "Fırça/Motor Sorunları":"Brush Motor Issues","Pil & Güç":"Battery & Power",
+    "Navigasyon Sistemi":"Navigation System","Süpürge/Temizlik":"Vacuum System","Diğer":"Other",
+    "Navigasyon":"Navigation System","Harita/Durum":"Navigation System",
+    "Hareket":"Brush Motor Issues","Temizlik":"Vacuum System",
+    "Güç/Batarya":"Battery & Power","Donanım/İletişim":"Other","Bilinmiyor":"Other",
+    "Sensör Kaybı":"Other",
+  };
+  return m[label] || label;
+}
+// Reverse lookup the canonical category code for a possibly-translated label.
 const state = {
   page:1, pageSize:5, search:"", status:"All Statuses", faultType:"All Fault Types",
   fh:{page:1, pageSize:8, search:"", robot:"All Robots", fault_type:"All Fault Types", status:"All Statuses", start_date:"", end_date:""},
@@ -2782,7 +2807,6 @@ async function loadFilterOptions(){
     document.getElementById("faultFilter").innerHTML     = asOptions(d.fault_types);
     document.getElementById("fhRobotFilter").innerHTML   = asOptions(d.robots);
     document.getElementById("fhFaultFilter").innerHTML   = asOptions(d.fault_types);
-    document.getElementById("fhStatusFilter").innerHTML  = asOptions(d.statuses);
     document.getElementById("predRobotFilter").innerHTML = asOptions(d.robots);
     document.getElementById("predCategoryFilter").innerHTML = asOptions(d.categories);
     document.getElementById("degrCategoryFilter").innerHTML = asOptions(d.categories);
@@ -2877,14 +2901,25 @@ function bindFaultHistoryUI(){
   document.getElementById("fhFaultFilter").addEventListener("change", e=>{
     state.fh.fault_type = e.target.value; state.fh.page = 1; loadFhList();
   });
-  document.getElementById("fhStatusFilter").addEventListener("change", e=>{
-    state.fh.status = e.target.value; state.fh.page = 1; loadFhList();
+  const startEl = document.getElementById("fhStartDate");
+  const endEl   = document.getElementById("fhEndDate");
+  startEl.addEventListener("change", e=>{
+    state.fh.start_date = e.target.value; state.fh.page = 1;
+    // Constrain the end-date input so it cannot be set earlier than the
+    // chosen start. If the user already picked an end before this start,
+    // clear it so the request doesn't fight the now-invalid value.
+    endEl.min = e.target.value || "";
+    if (endEl.value && e.target.value && endEl.value < e.target.value){
+      endEl.value = "";
+      state.fh.end_date = "";
+    }
+    loadFaultHistory();
   });
-  document.getElementById("fhStartDate").addEventListener("change", e=>{
-    state.fh.start_date = e.target.value; state.fh.page = 1; loadFaultHistory();
-  });
-  document.getElementById("fhEndDate").addEventListener("change", e=>{
-    state.fh.end_date = e.target.value; state.fh.page = 1; loadFaultHistory();
+  endEl.addEventListener("change", e=>{
+    state.fh.end_date = e.target.value; state.fh.page = 1;
+    // Symmetric guard: the start input can't be later than the chosen end.
+    startEl.max = e.target.value || "";
+    loadFaultHistory();
   });
 }
 
@@ -2893,9 +2928,10 @@ function clearFhFilters(){
   document.getElementById("fhSearch").value = "";
   document.getElementById("fhRobotFilter").value = "";
   document.getElementById("fhFaultFilter").value = "";
-  document.getElementById("fhStatusFilter").value = "";
-  document.getElementById("fhStartDate").value = "";
-  document.getElementById("fhEndDate").value = "";
+  const sd = document.getElementById("fhStartDate");
+  const ed = document.getElementById("fhEndDate");
+  sd.value = ""; sd.removeAttribute("max");
+  ed.value = ""; ed.removeAttribute("min");
   loadFaultHistory();
 }
 
@@ -2911,8 +2947,20 @@ async function loadFhFrequency(){
     const labels = (d.labels_iso || d.labels || []).map(iso =>
       new Date(iso).toLocaleDateString(locale(), {month:"short", year:"numeric"})
     );
-    const datasets = d.datasets.map(ds=>({label:ds.label, data:ds.data,
-      backgroundColor: CAT_COLORS[ds.label] || "#94a3b8", borderRadius:4}));
+    // Resolve the bar colour through the canonical category code, so a
+    // translated dataset label still maps to the right palette entry.
+    const datasets = d.datasets.map(ds => {
+      const key = canonicalCategory(ds.label);
+      const color = CAT_COLORS[key] || CAT_COLORS[ds.label] || "#94a3b8";
+      return {
+        label: ds.label,
+        data: ds.data,
+        backgroundColor: color,
+        hoverBackgroundColor: color,
+        borderRadius: 4,
+        borderSkipped: false,
+      };
+    });
     const ctx = document.getElementById("freqChart").getContext("2d");
     charts.freqChart?.destroy();
     charts.freqChart = new Chart(ctx, {
@@ -2939,7 +2987,7 @@ async function loadFhList(){
     renderPagination("fhPagination","fhPaginationInfo", d, x=>{state.fh.page=x; loadFhList();}, "faults");
   }catch(e){
     document.getElementById("fhTableBody").innerHTML =
-      `<tr><td colspan="7" class="empty">Failed to load: ${escapeHtml(String(e))}</td></tr>`;
+      `<tr><td colspan="8" class="empty">Failed to load: ${escapeHtml(String(e))}</td></tr>`;
   }
 }
 
@@ -2949,18 +2997,21 @@ const CAT_I18N = {
 };
 function renderFhTable({items}){
   const body = document.getElementById("fhTableBody");
-  if (!items.length){ body.innerHTML = `<tr><td colspan="7" class="empty">${t("noFaults")}</td></tr>`; return; }
+  if (!items.length){ body.innerHTML = `<tr><td colspan="8" class="empty">${t("noFaults")}</td></tr>`; return; }
   body.innerHTML = items.map(it=>{
-    const catColor = CAT_COLORS[it.category] || "#94a3b8";
+    const catKey = canonicalCategory(it.category);
+    const catColor = CAT_COLORS[catKey] || CAT_COLORS[it.category] || "#94a3b8";
     const resCls = it.resolution==="Resolved" ? "resolved" : "in-progress";
     const resLabel = it.resolution==="Resolved" ? t("resolved") : t("inProgress");
-    const catLabel = t(CAT_I18N[it.category]) || it.category;
+    const catLabel = t(CAT_I18N[catKey] || CAT_I18N[it.category]) || it.category;
+    const errorId = it.error_id || "—";
     return `
       <tr>
         <td><div style="font-weight:600">${formatDate(it.task_time)}</div>
             <div style="font-size:11.5px;color:var(--text-mute)">${formatTimeOnly(it.task_time)}</div></td>
         <td><div class="robot-id-cell"><div class="robot-thumb">${robotSvg()}</div>
               <div class="robot-id">${escapeHtml(shortenId(it.robot_id))}</div></div></td>
+        <td><span class="mono-id" title="${escapeAttr(errorId)}">${escapeHtml(errorId)}</span></td>
         <td><span class="cat-dot" style="background:${catColor}"></span>${escapeHtml(catLabel)}</td>
         <td><div class="fault-name">${escapeHtml(it.diagnosed_issue)}</div>
             <div class="fault-detail">${escapeHtml(it.fault_type_raw)}</div></td>
