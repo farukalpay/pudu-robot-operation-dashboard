@@ -750,51 +750,52 @@ def api_pred_heatmap(
     days: int | None = Query(default=None, ge=1, le=730),
     robot_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
-    """Per-robot forward risk grid. `days` overrides `weeks` when supplied."""
+    """Per-robot risk grid.
+
+    Always renders multiple time buckets (daily when the window is <=14
+    days, weekly otherwise) so the heatmap shows columns instead of one
+    full-width bar. Engine-available mode is used only to score WHICH
+    robots show up in the grid; the cell colors come from the historical
+    fault-risk bucketed query below.
+    """
     with get_cursor() as cur:
         snapshot = MODEL_RUNTIME.snapshot()
         horizon_days = days if days is not None else weeks * 7
         horizon_hours = _prediction_horizon_hours(snapshot, horizon_days)
         robot = robot_id if robot_id and robot_id.lower() not in ("", "all", "all robots") else None
+
+        # When the live engine is available, use its ranking to pick the top-N
+        # robots; otherwise the fallback _head_reference_rows query does the
+        # same. Either way we always run the bucketed historical risk query
+        # below so the grid has visible columns.
+        chosen_robot_ids: list[str] = []
         if snapshot.engine_available:
-            items, meta = _head_rows(cur, None, None, horizon_hours, robot)
-            if not items:
-                return {"robot_ids": [], "weeks": [], "grid": [], **meta}
-            if robot:
-                active_items = items
-            else:
-                active_items = sorted(
+            items, _meta = _head_rows(cur, None, None, horizon_hours, robot)
+            if items:
+                ranked = items if robot else sorted(
                     items,
                     key=lambda item: (
                         -(item["head_3"]["next_7d_fail_prob"] or 0),
                         item["robot_id"],
                     ),
-                )[:8]
-            return {
-                **meta,
-                "robot_ids": [item["robot_id"] for item in active_items],
-                "weeks": [f"Next {horizon_days}d"],
-                "grid": [[item["head_3"]["next_7d_fail_prob"] or 0] for item in active_items],
-                "source": _model_source(snapshot),
-            }
+                )
+                chosen_robot_ids = [item["robot_id"] for item in ranked][:8 if not robot else None]
 
         reference_rows, _start, reference = _head_reference_rows(cur, None, None, horizon_hours, robot)
         robot_ids = [r["robot_id"] for r in reference_rows if r["robot_id"]]
         if not robot_ids:
             return {"robot_ids": [], "weeks": [], "grid": []}
 
-        _data_start, data_end = _data_window(cur)
-        observed_end = min(reference + timedelta(hours=horizon_hours), data_end)
-        if observed_end <= reference:
-            return {
-                "robot_ids": robot_ids[:1] if robot else robot_ids[:8],
-                "weeks": [],
-                "grid": [],
-                "source": _model_source(snapshot),
-                "reference_time": reference.isoformat(),
-                "horizon_hours": horizon_hours,
-            }
+        # If engine-mode produced a ranking, prefer that list and keep
+        # the fallback robot_ids only as a top-up.
+        if chosen_robot_ids:
+            robot_ids = chosen_robot_ids
 
+        # Look BACKWARDS from the reference time. Historical snapshots have
+        # no future data, so forward-looking buckets were always empty,
+        # which is exactly why the previous heatmap collapsed to a single
+        # bar per robot. Past N days produces a real bucketed risk grid.
+        observed_start = reference - timedelta(hours=horizon_hours)
         grain = "day" if horizon_hours <= 14 * 24 else "week"
         failure_sql, failure_params = _failure_condition_sql("error_level")
         placeholders = ",".join(["%s"] * len(robot_ids))
@@ -805,17 +806,17 @@ def api_pred_heatmap(
                    COUNT(*) AS events,
                    MAX(hourly_ratio) AS risk
             FROM public.robot_logs_error
-            WHERE task_time > %s
+            WHERE task_time >= %s
               AND task_time <= %s
               AND robot_id IN ({placeholders})
               AND ({failure_sql})
             GROUP BY robot_id, bkt
             ORDER BY robot_id, bkt;
             """,
-            [reference, observed_end, *robot_ids, *failure_params],
+            [observed_start, reference, *robot_ids, *failure_params],
         )
         rows = cur.fetchall()
-        bucket_keys = _bucket_keys(reference, observed_end, grain)
+        bucket_keys = _bucket_keys(observed_start, reference, grain)
         robots: dict[str, dict[datetime, float]] = {rid: {b: 0.0 for b in bucket_keys} for rid in robot_ids}
         for r in rows:
             bucket = r["bkt"]
@@ -830,7 +831,7 @@ def api_pred_heatmap(
             "robot_ids": [rid for rid, _ in active_robots],
             "weeks": bucket_labels,
             "grid": [[active_robots[i][1].get(bucket, 0) for bucket in bucket_keys] for i in range(len(active_robots))],
-            "source": "future_target_window",
+            "source": "historical_lookback",
             "reference_time": reference.isoformat(),
             "horizon_hours": horizon_hours,
         }
@@ -946,6 +947,7 @@ def api_pred_degradation(
 def api_pred_stats(
     days: int = Query(7, ge=1, le=365),
     robot_id: str | None = Query(default=None),
+    category: str | None = Query(default=None),
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict[str, Any]:
@@ -954,6 +956,12 @@ def api_pred_stats(
         horizon_hours = _prediction_horizon_hours(snapshot, days)
         robot = robot_id if robot_id and robot_id.lower() not in ("", "all", "all robots") else None
         items, meta = _head_rows(cur, start_date, end_date, horizon_hours, robot)
+        # Apply the top-bar Category filter on the head outputs. Each item
+        # already carries a "component" derived via _category_for_error_type,
+        # so post-filtering here keeps both KPIs (High Severity + Predicted
+        # Failures) and the Model Accuracy summary in sync.
+        if category and category.lower() not in ("", "all", "all components"):
+            items = [it for it in items if it.get("component") == category]
         total = len(items)
         current_failures = sum(1 for item in items if item["head_1"]["is_failure_now"])
         future_failures = sum(1 for item in items if item["head_3"]["future_failure_observed"])
@@ -1756,6 +1764,16 @@ body.dark .stat-title{color:var(--text-mute)}
   background-image:url("data:image/svg+xml;utf8,<svg fill='none' stroke='%236b7280' stroke-width='2' viewBox='0 0 24 24' xmlns='http://www.w3.org/2000/svg'><polyline points='6 9 12 15 18 9'/></svg>");
   background-repeat:no-repeat;background-position:right 4px center;background-size:10px}
 body.dark .head-select{background-color:#172238;color:var(--text);border-color:var(--border)}
+/* Larger head dropdown when used next to the "Robot-Level Head Outputs"
+   section title (instead of inside a KPI card). */
+.head-select-lg{margin-left:auto;font-size:13px;padding:6px 28px 6px 12px;
+  background-position:right 8px center;background-size:12px}
+.section-head-with-select{display:flex;align-items:center;justify-content:space-between;
+  gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.section-head-with-select h3{margin:0;font-size:15px;font-weight:600}
+/* Selected-head summary card lives INSIDE the Robot-Level Head Outputs
+   section, just under the title row, so trim its outer margin. */
+.selected-head-card{margin-bottom:18px}
 .stat-value{font-size:30px;font-weight:700;line-height:1.1}
 .stat-sub{font-size:12px;color:var(--text-mute);margin-top:2px}
 .stat-trend{text-align:right}
@@ -2215,8 +2233,6 @@ table.data tbody tr:last-child td{border-bottom:none}
         <select class="select" id="predCategoryFilter"></select>
         <select class="select" id="predWindowFilter">
           <option value="7">Next 7 Days</option>
-          <option value="30">Next 30 Days</option>
-          <option value="90">Next 90 Days</option>
         </select>
       </div>
 
@@ -2237,7 +2253,6 @@ table.data tbody tr:last-child td{border-bottom:none}
             <select class="select" id="degrCategoryFilter"></select>
           </div>
           <div class="degr-single">
-            <h4 data-i18n="lstmModelPred">LSTM Model Prediction</h4>
             <div class="mini lstm-big">
               <span class="pred-badge" id="lstmBadge">—</span>
               <canvas id="lstmChart"></canvas>
@@ -2246,49 +2261,49 @@ table.data tbody tr:last-child td{border-bottom:none}
         </div>
       </div>
 
-      <section class="cards" style="grid-template-columns:repeat(4,minmax(0,1fr))">
-        <div class="card stat">
-          <div class="stat-icon icon-green"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg></div>
-          <div class="stat-body"><div class="stat-title" data-i18n="avgFleetHealth">Average Fleet Health</div><div class="stat-value" id="predFleet">—%</div></div>
-          <div class="stat-trend" id="predFleetTrend"></div>
-          <div class="stat-bar"><div class="stat-bar-fill green" id="predFleetBar" style="width:0%"></div></div>
-        </div>
+      <section class="cards" style="grid-template-columns:repeat(2,minmax(0,1fr))">
         <div class="card stat">
           <div class="stat-icon icon-red"><svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 L22 20 L2 20 Z"></path><path d="M12 9v5"></path><circle cx="12" cy="17" r="1" fill="currentColor"></circle></svg></div>
-          <div class="stat-body"><div class="stat-title" data-i18n="highRiskRobots">High Risk Robots</div><div class="stat-value" id="predHighRisk">—</div></div>
+          <div class="stat-body"><div class="stat-title" data-i18n="highRiskRobots">High Severity Robots</div><div class="stat-value" id="predHighRisk">—</div></div>
           <div class="stat-trend" id="predHighRiskTrend"></div>
           <div class="stat-bar"><div class="stat-bar-fill red" id="predHighRiskBar" style="width:0%"></div></div>
         </div>
         <div class="card stat">
           <div class="stat-icon icon-blue"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v6l4 2"></path></svg></div>
-          <div class="stat-body"><div class="stat-title" data-i18n="predFailures">Predicted Failures (48h)</div><div class="stat-value" id="predFail">—</div></div>
+          <div class="stat-body"><div class="stat-title" data-i18n="predFailures">Predicted Failures</div><div class="stat-value" id="predFail">—</div></div>
           <div class="stat-trend" id="predFailTrend"></div>
           <div class="stat-bar"><div class="stat-bar-fill blue" id="predFailBar" style="width:0%"></div></div>
         </div>
-        <div class="card stat">
+      </section>
+
+      <section class="card">
+        <!-- Title row with the Head selector to its right. The dropdown
+             controls everything rendered inside this card: the Model
+             Accuracy summary AND the per-robot head output cards below. -->
+        <div class="chart-head section-head-with-select">
+          <h3 data-i18n="topFailurePred">Robot-Level Head Outputs</h3>
+          <select class="head-select head-select-lg" id="modelHeadSelect">
+            <option value="1">Head 1</option>
+            <option value="2">Head 2</option>
+            <option value="3">Head 3</option>
+            <option value="4">Head 4</option>
+          </select>
+        </div>
+
+        <!-- Selected-head summary (formerly the 4th KPI card). Reads from
+             the same /api/predictions/stats payload and reacts to both the
+             top filters AND the head selector right above. -->
+        <div class="card stat selected-head-card">
           <div class="stat-icon icon-purple"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M8 12l2.5 2.5L16 9"></path></svg></div>
           <div class="stat-body">
-            <div class="stat-title">
-              <span data-i18n="modelAccuracy">Model Accuracy</span>
-              <select class="head-select" id="modelHeadSelect">
-                <option value="1">Head 1</option>
-                <option value="2">Head 2</option>
-                <option value="3">Head 3</option>
-                <option value="4">Head 4</option>
-              </select>
-            </div>
+            <div class="stat-title"><span data-i18n="modelAccuracy">Model Accuracy</span></div>
             <div class="stat-value" id="predAcc">—%</div>
             <div class="stat-sub" id="predHeadHint"></div>
           </div>
           <div class="stat-trend" id="predAccTrend"></div>
           <div class="stat-bar"><div class="stat-bar-fill purple" id="predAccBar" style="width:0%"></div></div>
         </div>
-      </section>
 
-      <section class="card">
-        <div class="chart-head">
-          <h3 data-i18n="topFailurePred">Top Failure Predictions (Next 48 Hours)</h3>
-        </div>
         <div class="pred-cards" id="predCardsContainer"><div class="empty">Loading…</div></div>
       </section>
     </section>
@@ -2311,12 +2326,8 @@ table.data tbody tr:last-child td{border-bottom:none}
   <h4 data-i18n="selectRange">Select Date Range</h4>
   <div class="quick">
     <button class="past-range" onclick="applyQuickRange(7)" data-i18n="last7">Last 7 days</button>
-    <button class="past-range" onclick="applyQuickRange(30)" data-i18n="last30">Last 30 days</button>
-    <button class="past-range" onclick="applyQuickRange(90)" data-i18n="last90">Last 90 days</button>
     <button class="past-range" onclick="applyQuickRange('all')" data-i18n="allTime">All time</button>
     <button class="future-range" onclick="applyFutureRange(7)" data-i18n="next7Days">Next 7 Days</button>
-    <button class="future-range" onclick="applyFutureRange(30)" data-i18n="next30Days">Next 30 Days</button>
-    <button class="future-range" onclick="applyFutureRange(90)" data-i18n="next90Days">Next 90 Days</button>
   </div>
   <div class="row past-range"><label data-i18n="startDate">Start date</label><input type="date" id="rangeStartInput" /></div>
   <div class="row past-range"><label data-i18n="endDate">End date</label><input type="date" id="rangeEndInput" /></div>
@@ -2364,8 +2375,9 @@ const I18N = {
     next7Days:"Next 7 Days", next30Days:"Next 30 Days", next90Days:"Next 90 Days",
     startDate:"Start date", endDate:"End date", reset:"Reset", apply:"Apply",
     failureProb: "Failure Probability", predictedIssue: "Predicted Issue", estimatedTime: "Estimated Time", viewDetails: "View Details",
-    avgFleetHealth: "Average Fleet Health", highRiskRobots: "High Severity Robots", predFailures: "Predicted Failures", modelAccuracy: "Selected Head",
+    avgFleetHealth: "Average Fleet Health", highRiskRobots: "High Severity Robots", predFailures: "Predicted Failures", modelAccuracy: "Model Accuracy",
     topFailurePred: "Robot-Level Head Outputs",
+    legendActual:"Actual", legendPredicted:"Predicted", predictedFailure:"Predicted Failure",
     riskCritical:"Critical Risk", riskHigh:"High Risk", riskMedium:"Medium Risk", riskLow:"Low Risk",
     allRobots:"All Robots", allComponents:"All Components", allStatuses:"All Statuses", allFaultTypes:"All Fault Types",
     last7Days:"Last 7 Days", last30Days:"Last 30 Days", last90Days:"Last 90 Days",
@@ -2409,8 +2421,9 @@ const I18N = {
     next7Days:"Sonraki 7 Gün", next30Days:"Sonraki 30 Gün", next90Days:"Sonraki 90 Gün",
     startDate:"Başlangıç tarihi", endDate:"Bitiş tarihi", reset:"Sıfırla", apply:"Uygula",
     failureProb: "Arıza Olasılığı", predictedIssue: "Tahmin Edilen Sorun", estimatedTime: "Tahmini Zaman", viewDetails: "Detayları Gör",
-    avgFleetHealth: "Ortalama Filo Sağlığı", highRiskRobots: "Yüksek Şiddetli Robotlar", predFailures: "Tahmini Arızalar", modelAccuracy: "Seçili Head",
+    avgFleetHealth: "Ortalama Filo Sağlığı", highRiskRobots: "Yüksek Şiddetli Robotlar", predFailures: "Tahmini Arızalar", modelAccuracy: "Model Doğruluğu",
     topFailurePred: "Robot Bazlı Head Çıktıları",
+    legendActual:"Gerçek", legendPredicted:"Tahmin", predictedFailure:"Tahmin Edilen Arıza",
     riskCritical:"Kritik Risk", riskHigh:"Yüksek Risk", riskMedium:"Orta Risk", riskLow:"Düşük Risk",
     allRobots:"Tüm Robotlar", allComponents:"Tüm Bileşenler", allStatuses:"Tüm Durumlar", allFaultTypes:"Tüm Arıza Tipleri",
     last7Days:"Son 7 Gün", last30Days:"Son 30 Gün", last90Days:"Son 90 Gün",
@@ -3058,23 +3071,76 @@ function renderDegradation(canvasId, badgeId, d, color, useRf){
   charts[canvasId]?.destroy();
   const ctx = document.getElementById(canvasId).getContext("2d");
   const predData = useRf ? d.rf_pred : d.lstm_pred;
+  // Drop the leading "null" placeholder values in lstm_pred so the dashed
+  // segment visibly connects from the last actual point through the future.
+  const actualColor = color;
+  const predictedColor = "#94a3b8"; // distinct grey so dashed line stands apart
   charts[canvasId] = new Chart(ctx,{
     type:"line",
-    data:{ labels:d.labels,
+    data:{
+      labels: d.labels,
       datasets:[
-        {label:"Actual", data:d.actual, borderColor:color, backgroundColor:"transparent",
-         borderWidth:2, tension:0.3, pointRadius:2, spanGaps:false},
-        {label:"Predicted", data:predData, borderColor:color, backgroundColor:"transparent",
-         borderWidth:2, borderDash:[5,5], tension:0.3, pointRadius:2, spanGaps:false},
+        { label: t("legendActual") || "Actual",
+          data: d.actual,
+          borderColor: actualColor,
+          backgroundColor: "transparent",
+          borderWidth: 2.5,
+          tension: 0.35,
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          pointHitRadius: 8,
+          spanGaps: false },
+        { label: t("legendPredicted") || "Predicted",
+          data: predData,
+          borderColor: predictedColor,
+          backgroundColor: "transparent",
+          borderWidth: 2.5,
+          borderDash: [6, 4],
+          tension: 0.35,
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          pointHitRadius: 8,
+          spanGaps: true },
       ]
     },
-    options:{ responsive:true, maintainAspectRatio:false,
-      plugins:{legend:{display:true, position:"top", labels:{boxWidth:10, font:{size:10}}}},
-      scales:{ x:{grid:{display:false}, ticks:{color:"#94a3b8", font:{size:10}}},
-               y:{beginAtZero:true, max:100, grid:{color:"#eef2f7"}, ticks:{color:"#94a3b8", font:{size:10}}} } }
+    options:{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          display: true,
+          position: "top",
+          align: "end",
+          labels: {
+            boxWidth: 24,
+            boxHeight: 0,
+            usePointStyle: false,
+            font: { size: 11, weight: "600" },
+            // Render each legend swatch as a line segment that mirrors the
+            // dataset's borderDash, so the legend matches what's drawn.
+            generateLabels(chart){
+              return chart.data.datasets.map((ds, i) => ({
+                text: ds.label,
+                strokeStyle: ds.borderColor,
+                fillStyle: ds.borderColor,
+                lineWidth: 2,
+                lineDash: ds.borderDash || [],
+                hidden: !chart.isDatasetVisible(i),
+                datasetIndex: i,
+              }));
+            },
+          },
+        },
+        tooltip: { backgroundColor: "#1f2937", padding: 10 },
+      },
+      scales: {
+        x: { grid:{display:false}, ticks:{color:"#94a3b8", font:{size:10}} },
+        y: { beginAtZero:true, max:100, grid:{color:"#eef2f7"}, ticks:{color:"#94a3b8", font:{size:10}} },
+      },
+    }
   });
   if (d.predicted_failure_label){
-    document.getElementById(badgeId).innerHTML = `Predicted Failure<br><strong>${escapeHtml(d.predicted_failure_label)}</strong>`;
+    document.getElementById(badgeId).innerHTML = `${t("predictedFailure") || "Predicted Failure"}<br><strong>${escapeHtml(d.predicted_failure_label)}</strong>`;
   } else { document.getElementById(badgeId).textContent = "—"; }
 }
 
@@ -3082,8 +3148,12 @@ async function loadPredStats(){
   try{
     const params = new URLSearchParams({days: state.pred.windowDays || 7});
     if (state.pred.robot) params.set("robot_id", state.pred.robot);
+    // Forward the top-filter category so High Severity / Predicted Failures
+    // respond to the dropdown choice. Backend just ignores the param when
+    // it's not a recognised category.
+    const selCat = document.getElementById("predCategoryFilter")?.value;
+    if (selCat) params.set("category", selCat);
     const d = await fetchJson(`/api/predictions/stats?${params}`);
-    setPredCard("predFleet","predFleetTrend","predFleetBar", d.fleet_health.value+"%", d.fleet_health.delta_pct, d.fleet_health.value);
     setPredCard("predHighRisk","predHighRiskTrend","predHighRiskBar", d.high_risk.value, d.high_risk.delta_pct, Math.min(100, d.high_risk.value*12));
     setPredCard("predFail","predFailTrend","predFailBar", d.predicted_fail.value, d.predicted_fail.delta_pct, Math.min(100, d.predicted_fail.value*12));
     state.pred.heads = d.model_heads || null;
