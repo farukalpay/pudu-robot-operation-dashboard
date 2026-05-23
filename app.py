@@ -579,6 +579,7 @@ def api_robots(
             prob = float(r["hourly_ratio"] or 0)
             forecast = seven_day.get(r["robot_id"], prob)
             code = _status_code(r["error_level"], prob, forecast)
+            legacy_status = _classify_status(r["error_level"], prob)
             severity = _normalize_severity(r["error_level"])
             if status and status.lower() not in ("all", "all statuses") and status.upper() != code:
                 continue
@@ -1047,6 +1048,7 @@ def api_top_failures(
     robot_id: str | None = Query(default=None),
     category: str | None = Query(default=None),
     head: str = Query(default="3"),
+    limit: int = Query(50, ge=1, le=500),
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict[str, Any]:
@@ -1119,7 +1121,7 @@ def api_top_failures(
         items.sort(key=lambda x: x["_sort"])
         for item in items:
             item.pop("_sort", None)
-        return {**meta, "head": selected_head, "items": items[:10]}
+        return {**meta, "head": selected_head, "items": items[:limit]}
 
 
 # ============================================================================
@@ -1602,6 +1604,10 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
 .date-picker{background:#fff;border:1px solid var(--border);padding:8px 14px;
   border-radius:8px;font-size:13px;cursor:pointer;font-family:inherit;color:inherit}
 .date-picker:hover{background:#f9fafc}
+.window-pill{display:inline-flex;align-items:center;gap:8px;background:#fff;border:1px solid var(--border);
+  border-radius:999px;padding:7px 12px;color:var(--text);box-shadow:var(--shadow)}
+.window-pill span{font-size:11px;color:var(--text-mute);font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.window-pill strong{font-size:12.5px;font-weight:700;color:var(--primary);white-space:nowrap}
 .bell{cursor:pointer}
 .bell:hover{background:#f9fafc}
 .topbar-right{position:relative}
@@ -1718,7 +1724,7 @@ body.dark{
   --text-mute:#94a3b8;
   --shadow:0 1px 2px rgba(0,0,0,.4),0 1px 3px rgba(0,0,0,.5);
 }
-	body.dark .bell,body.dark .date-picker,body.dark .icon-btn,body.dark .pagination button,
+	body.dark .bell,body.dark .date-picker,body.dark .window-pill,body.dark .icon-btn,body.dark .pagination button,
 	body.dark table.data thead th,body.dark .filter-row,body.dark .search input,
 	body.dark .select,body.dark .input-date,body.dark .btn-ghost,body.dark .pred-card .btn-view{
 	  background:#172238;color:var(--text);border-color:var(--border)
@@ -1778,6 +1784,19 @@ body.dark .head-select{background-color:#172238;color:var(--text);border-color:v
   margin-bottom:14px;gap:12px;flex-wrap:wrap}
 .chart-head h3{margin:0;font-size:15px;font-weight:600}
 .info{color:var(--text-mute);font-size:12px;cursor:help}
+.title-with-info{display:flex;align-items:center;gap:8px;min-width:0}
+.info-trigger{width:22px;height:22px;border-radius:50%;border:1px solid var(--border);
+  background:#fff;color:var(--primary);font-size:12px;font-weight:800;line-height:1;
+  display:inline-grid;place-items:center;box-shadow:0 1px 2px rgba(15,23,42,.05)}
+.info-trigger:hover{background:var(--blue-soft);border-color:#bfdbfe}
+.info-popover-panel{position:absolute;top:52px;right:20px;width:min(360px,calc(100% - 40px));
+  background:#fff;border:1px solid var(--border);border-radius:12px;box-shadow:0 16px 38px rgba(15,23,42,.18);
+  z-index:40;padding:14px 16px;color:var(--text)}
+.info-popover-panel[hidden]{display:none}
+.info-popover-panel h4{margin:0 0 8px;font-size:13.5px;font-weight:700}
+.info-popover-panel p{margin:0 0 10px;color:var(--text-mute);font-size:12.5px;line-height:1.45}
+.info-popover-panel ul{margin:0;padding-left:18px;display:grid;gap:7px}
+.info-popover-panel li{font-size:12.5px;line-height:1.35;color:var(--text)}
 .chart-body{position:relative;height:260px}
 .donut-wrap{display:flex;align-items:center;gap:24px;justify-content:center;height:100%}
 .donut-wrap canvas{flex:0 0 200px;max-width:200px;max-height:200px}
@@ -1901,6 +1920,7 @@ table.data tbody tr:last-child td{border-bottom:none}
 .cat-legend .dot{width:9px;height:9px;border-radius:50%}
 
 .heat-card,.degr-card{padding:20px}
+.degr-card{position:relative}
 .preds-row{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}
 .heatmap{display:grid;gap:6px;align-items:center;margin-top:10px}
 .heatmap .row{display:flex;align-items:center;gap:6px}
@@ -1953,6 +1973,14 @@ table.data tbody tr:last-child td{border-bottom:none}
 .pred-card .btn-view{background:#fff;color:var(--primary);border:1px solid var(--primary);
   padding:6px 10px;border-radius:8px;font-weight:600;font-size:12.5px;width:100%;cursor:pointer}
 .pred-card .btn-view:hover{background:var(--primary);color:#fff}
+.pred-load-more{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:14px;flex-wrap:wrap}
+.pred-load-more[hidden]{display:none}
+.btn-load-more{background:var(--primary);color:#fff;border:1px solid var(--primary);
+  border-radius:8px;padding:8px 16px;font-size:12.5px;font-weight:700}
+.btn-load-more:hover{background:var(--primary-2)}
+.pred-load-more .count{font-size:12px;color:var(--text-mute)}
+body.dark .info-trigger{background:#172238;color:#93c5fd;border-color:var(--border)}
+body.dark .info-popover-panel{background:#111a2c;border-color:var(--border);box-shadow:0 16px 38px rgba(0,0,0,.45)}
 
 	@media (max-width:1100px){.charts,.preds-row,.runtime-strip{grid-template-columns:1fr}
   .donut-wrap{flex-wrap:wrap}
@@ -2206,18 +2234,16 @@ table.data tbody tr:last-child td{border-bottom:none}
         </div>
         <div class="topbar-right">
           <button class="bell" aria-label="Notifications" onclick="toggleNotifPanel(event)"><span>🔔</span><span class="bell-badge" id="bellBadge3">0</span></button>
-          <button class="date-picker" id="predDateRange" onclick="toggleDatePicker(event,'predDateRange')">Next 7 Days ▾</button>
+          <span class="window-pill" id="predWindowPill">
+            <span data-i18n="predictionWindow">Prediction Window</span>
+            <strong id="predWindowPillValue" data-i18n="next7Days">Next 7 Days</strong>
+          </span>
         </div>
       </header>
 
       <div class="filter-row">
         <select class="select" id="predRobotFilter"></select>
         <select class="select" id="predCategoryFilter"></select>
-        <select class="select" id="predWindowFilter">
-          <option value="7">Next 7 Days</option>
-          <option value="30">Next 30 Days</option>
-          <option value="90">Next 90 Days</option>
-        </select>
       </div>
 
       <div class="preds-row">
@@ -2233,13 +2259,24 @@ table.data tbody tr:last-child td{border-bottom:none}
 
         <div class="card degr-card">
           <div class="chart-head">
-            <h3 data-i18n="componentDegradation">Component Degradation Over Time</h3>
+            <div class="title-with-info">
+              <h3 data-i18n="componentDegradation">Component Degradation Over Time</h3>
+              <button class="info-trigger" type="button" aria-label="How to read this chart" onclick="toggleDegradationInfo(event)">i</button>
+            </div>
             <select class="select" id="degrCategoryFilter"></select>
+          </div>
+          <div class="info-popover-panel" id="degrInfoPopover" hidden onclick="event.stopPropagation()">
+            <h4 data-i18n="degradationInfoTitle">How to read this chart</h4>
+            <p data-i18n="degradationInfoBody">The solid line is observed component risk. The dashed line is the model forecast for the fixed prediction window.</p>
+            <ul>
+              <li data-i18n="degradationInfoLow">Low and flat values mean the component is stable.</li>
+              <li data-i18n="degradationInfoRising">A rising line means the component is degrading and should be monitored.</li>
+              <li data-i18n="degradationInfoHigh">Values near the top mean higher failure probability and stronger maintenance priority.</li>
+            </ul>
           </div>
           <div class="degr-single">
             <h4 data-i18n="lstmModelPred">LSTM Model Prediction</h4>
             <div class="mini lstm-big">
-              <span class="pred-badge" id="lstmBadge">—</span>
               <canvas id="lstmChart"></canvas>
             </div>
           </div>
@@ -2287,9 +2324,13 @@ table.data tbody tr:last-child td{border-bottom:none}
 
       <section class="card">
         <div class="chart-head">
-          <h3 data-i18n="topFailurePred">Top Failure Predictions (Next 48 Hours)</h3>
+          <h3 data-i18n="topFailurePred">Robot-Level Head Outputs</h3>
         </div>
         <div class="pred-cards" id="predCardsContainer"><div class="empty">Loading…</div></div>
+        <div class="pred-load-more" id="predLoadMoreWrap" hidden>
+          <button class="btn-load-more" type="button" onclick="loadMoreTopFailures()" data-i18n="loadMoreRobots">Load more</button>
+          <span class="count" id="predLoadMoreInfo"></span>
+        </div>
       </section>
     </section>
 
@@ -2362,6 +2403,12 @@ const I18N = {
     selectRange: "Select Date Range", predictionWindow:"Prediction Window",
     last7:"Last 7 days", last30:"Last 30 days", last90:"Last 90 days", allTime:"All time",
     next7Days:"Next 7 Days", next30Days:"Next 30 Days", next90Days:"Next 90 Days",
+    forecastLabel:"Forecast", loadMoreRobots:"Load more", showingPredictions:"Showing {0} of {1}",
+    degradationInfoTitle:"How to read this chart",
+    degradationInfoBody:"The solid line is observed component risk. The dashed line is the model forecast for the fixed prediction window.",
+    degradationInfoLow:"Low and flat values mean the component is stable.",
+    degradationInfoRising:"A rising line means the component is degrading and should be monitored.",
+    degradationInfoHigh:"Values near the top mean higher failure probability and stronger maintenance priority.",
     startDate:"Start date", endDate:"End date", reset:"Reset", apply:"Apply",
     failureProb: "Failure Probability", predictedIssue: "Predicted Issue", estimatedTime: "Estimated Time", viewDetails: "View Details",
     avgFleetHealth: "Average Fleet Health", highRiskRobots: "High Severity Robots", predFailures: "Predicted Failures", modelAccuracy: "Selected Head",
@@ -2407,6 +2454,12 @@ const I18N = {
     selectRange: "Tarih Aralığı Seç", predictionWindow:"Tahmin Penceresi",
     last7:"Son 7 gün", last30:"Son 30 gün", last90:"Son 90 gün", allTime:"Tüm zaman",
     next7Days:"Sonraki 7 Gün", next30Days:"Sonraki 30 Gün", next90Days:"Sonraki 90 Gün",
+    forecastLabel:"Öngörü", loadMoreRobots:"Daha fazla yükle", showingPredictions:"{1} robottan {0} gösteriliyor",
+    degradationInfoTitle:"Bu grafik nasıl okunur?",
+    degradationInfoBody:"Düz çizgi gözlenen bileşen riskini, kesikli çizgi sabit tahmin penceresi için model öngörüsünü gösterir.",
+    degradationInfoLow:"Düşük ve yatay değerler bileşenin stabil olduğunu gösterir.",
+    degradationInfoRising:"Yükselen çizgi bileşenin yıprandığını ve izlenmesi gerektiğini gösterir.",
+    degradationInfoHigh:"Üst seviyelere yaklaşan değerler daha yüksek arıza olasılığı ve bakım önceliği demektir.",
     startDate:"Başlangıç tarihi", endDate:"Bitiş tarihi", reset:"Sıfırla", apply:"Uygula",
     failureProb: "Arıza Olasılığı", predictedIssue: "Tahmin Edilen Sorun", estimatedTime: "Tahmini Zaman", viewDetails: "Detayları Gör",
     avgFleetHealth: "Ortalama Filo Sağlığı", highRiskRobots: "Yüksek Şiddetli Robotlar", predFailures: "Tahmini Arızalar", modelAccuracy: "Seçili Head",
@@ -2519,6 +2572,7 @@ function applyLanguage(lang){
   }
   // Re-render the model head card so the hint (label · metric) follows the lang.
   if (state && state.pred && state.pred.heads) renderModelHeadCard();
+  if (state && state.pred && state.pred.topFailureItems?.length) renderTopFailures();
 }
 function setLanguage(lang){ applyLanguage(lang); reloadCurrentPage(); refreshNotificationBadge(); }
 function applyTheme(theme){
@@ -2542,7 +2596,7 @@ const CAT_COLORS = {
 const state = {
   page:1, pageSize:5, search:"", status:"All Statuses", faultType:"All Fault Types",
   fh:{page:1, pageSize:8, search:"", robot:"All Robots", fault_type:"All Fault Types", status:"All Statuses", start_date:"", end_date:""},
-  pred:{category:"", robot:"All Robots", windowDays:7, head:"1", heads:null},
+  pred:{category:"", robot:"All Robots", windowDays:7, head:"1", heads:null, topVisible:5, topFailureItems:[]},
   // global date filter shared across dashboard/predictions/fault-history
   range:{ start:"", end:"", extentStart:"", extentEnd:"" },
   notifications:{ items:[], dismissedAt:null },
@@ -2636,6 +2690,8 @@ function predictionWindowText(days){
 function updatePredictionWindowLabel(){
   const btn = document.getElementById("predDateRange");
   if (btn) btn.textContent = predictionWindowText(state.pred.windowDays) + " ▾";
+  const pill = document.getElementById("predWindowPillValue");
+  if (pill) pill.textContent = predictionWindowText(7);
 }
 
 async function loadRuntime(){
@@ -2791,7 +2847,7 @@ async function loadRobots(){
     renderPagination("pagination","paginationInfo", d, p=>{state.page=p; loadRobots();}, "robots");
   }catch(e){
     document.getElementById("robotTableBody").innerHTML =
-      `<tr><td colspan="6" class="empty">Failed to load: ${escapeHtml(String(e))}</td></tr>`;
+      `<tr><td colspan="8" class="empty">Failed to load: ${escapeHtml(String(e))}</td></tr>`;
   }
 }
 
@@ -2964,16 +3020,19 @@ function renderFhTable({items}){
 function bindPredictionsUI(){
   document.getElementById("degrCategoryFilter").addEventListener("change", e=>{
     state.pred.category = e.target.value;
+    state.pred.topVisible = 5;
     const top = document.getElementById("predCategoryFilter");
     if (top && [...top.options].some(o=>o.value===e.target.value)) top.value = e.target.value;
     loadDegradation(); loadPredStats(); loadTopFailures();
   });
   document.getElementById("predRobotFilter").addEventListener("change", e=>{
     state.pred.robot = e.target.value;  // "" = all
+    state.pred.topVisible = 5;
     loadHeatmap(); loadDegradation(); loadPredStats(); loadTopFailures();
   });
   document.getElementById("predCategoryFilter").addEventListener("change", e=>{
     const v = e.target.value;
+    state.pred.topVisible = 5;
     if (v){  // concrete category chosen
       state.pred.category = v;
       const inner = document.getElementById("degrCategoryFilter");
@@ -2982,13 +3041,9 @@ function bindPredictionsUI(){
     }
     loadPredStats(); loadTopFailures();
   });
-  document.getElementById("predWindowFilter").addEventListener("change", e=>{
-    state.pred.windowDays = parseInt(e.target.value, 10) || 7;
-    updatePredictionWindowLabel();
-    loadHeatmap(); loadDegradation(); loadPredStats(); loadTopFailures();
-  });
   document.getElementById("modelHeadSelect").addEventListener("change", e=>{
     state.pred.head = e.target.value;
+    state.pred.topVisible = 5;
     renderModelHeadCard();
     loadTopFailures();
   });
@@ -3026,13 +3081,17 @@ async function loadHeatmap(){
                 ${cells}
               </div>`;
     }).join("");
-    const footCells = d.weeks.map(w => `<div class="hlabel">${escapeHtml(w)}</div>`).join("");
+    const footCells = d.weeks.map(w => `<div class="hlabel">${escapeHtml(predictionAxisLabel(w))}</div>`).join("");
     const foot = `<div class="hrow foot" style="grid-template-columns:${cols}">
                     <div class="empty-slot"></div>
                     ${footCells}
                   </div>`;
     grid.innerHTML = rows + foot;
   }catch(e){ console.error(e); }
+}
+
+function predictionAxisLabel(label){
+  return /^Next\s+\d+d$/i.test(String(label || "")) ? t("forecastLabel") : label;
 }
 
 function riskColor(v){
@@ -3050,17 +3109,18 @@ async function loadDegradation(){
     if (state.pred.robot) params.set("robot_id", state.pred.robot);
     if (state.pred.windowDays) params.set("days", state.pred.windowDays);
     const d = await fetchJson(`/api/predictions/degradation?${params}`);
-    renderDegradation("lstmChart", "lstmBadge", d, "#3b82f6", false);
+    renderDegradation("lstmChart", d, "#3b82f6", false);
   }catch(e){ console.error(e); }
 }
 
-function renderDegradation(canvasId, badgeId, d, color, useRf){
+function renderDegradation(canvasId, d, color, useRf){
   charts[canvasId]?.destroy();
   const ctx = document.getElementById(canvasId).getContext("2d");
   const predData = useRf ? d.rf_pred : d.lstm_pred;
+  const labels = d.labels.map(predictionAxisLabel);
   charts[canvasId] = new Chart(ctx,{
     type:"line",
-    data:{ labels:d.labels,
+    data:{ labels,
       datasets:[
         {label:"Actual", data:d.actual, borderColor:color, backgroundColor:"transparent",
          borderWidth:2, tension:0.3, pointRadius:2, spanGaps:false},
@@ -3073,9 +3133,6 @@ function renderDegradation(canvasId, badgeId, d, color, useRf){
       scales:{ x:{grid:{display:false}, ticks:{color:"#94a3b8", font:{size:10}}},
                y:{beginAtZero:true, max:100, grid:{color:"#eef2f7"}, ticks:{color:"#94a3b8", font:{size:10}}} } }
   });
-  if (d.predicted_failure_label){
-    document.getElementById(badgeId).innerHTML = `Predicted Failure<br><strong>${escapeHtml(d.predicted_failure_label)}</strong>`;
-  } else { document.getElementById(badgeId).textContent = "—"; }
 }
 
 async function loadPredStats(){
@@ -3116,39 +3173,63 @@ function setPredCard(valId, trendId, barId, val, delta, barPct){
 
 async function loadTopFailures(){
   try{
-    const params = new URLSearchParams({ days: state.pred.windowDays || 30 });
+    const params = new URLSearchParams({ days: 7, limit: 200 });
     if (state.pred.robot) params.set("robot_id", state.pred.robot);
     if (state.pred.head) params.set("head", state.pred.head);
     const selCat = document.getElementById("predCategoryFilter")?.value;
     if (selCat) params.set("category", selCat);
     const d = await fetchJson(`/api/predictions/top-failures?${params}`);
-    const root = document.getElementById("predCardsContainer");
-    if (!d.items.length){ root.innerHTML = `<div class="empty">No predictions available</div>`; return; }
-    root.innerHTML = d.items.slice(0,5).map(it=>{
-      const rk = it.risk_level || "Low";
-      const riskLabel = t("risk" + rk) || it.risk_level;
-      const value = it.value == null ? "—" : `${it.value}${it.unit === "%" ? "%" : " " + it.unit}`;
-      const estimate = it.estimated_time_label || formatLong(it.estimated_time);
-      return `
-        <div class="pred-card ${rk}">
-          <div class="head">
-            <div class="thumb">${robotSvg()}</div>
-            <div>
-              <div class="id">${escapeHtml(shortenId(it.robot_id))}</div>
-              <div class="area">${escapeHtml(it.area)}</div>
-            </div>
-          </div>
-          <div class="prob-row">
-            <span class="prob" style="color:${rk==='Critical'?'var(--red)':rk==='High'?'var(--amber)':rk==='Medium'?'#a16207':'var(--green)'}">${escapeHtml(value)}</span>
-            <span class="risk-pill ${rk}">${escapeHtml(riskLabel)}</span>
-          </div>
-          <div><div class="label-sm">${escapeHtml(it.value_label || t("failureProb"))}</div></div>
-          <div><div class="label-sm">${t("predictedIssue")}</div><div class="issue">${escapeHtml(it.predicted_issue)}</div></div>
-          <div><div class="label-sm">${t("estimatedTime")}</div><div class="time">${escapeHtml(estimate)}</div></div>
-          <button class="btn-view" onclick="openRobotModal('${escapeAttr(it.robot_id)}')">${t("viewDetails")}</button>
-        </div>`;
-    }).join("");
+    state.pred.topFailureItems = d.items || [];
+    renderTopFailures();
   }catch(e){ console.error(e); }
+}
+
+function renderTopFailures(){
+  const root = document.getElementById("predCardsContainer");
+  const wrap = document.getElementById("predLoadMoreWrap");
+  const info = document.getElementById("predLoadMoreInfo");
+  const items = state.pred.topFailureItems || [];
+  if (!items.length){
+    root.innerHTML = `<div class="empty">No predictions available</div>`;
+    if (wrap) wrap.hidden = true;
+    return;
+  }
+  const visible = Math.min(state.pred.topVisible || 5, items.length);
+  root.innerHTML = items.slice(0, visible).map(renderTopFailureCard).join("");
+  if (wrap){
+    wrap.hidden = visible >= items.length;
+    if (info) info.textContent = tf("showingPredictions", visible, items.length);
+  }
+}
+
+function renderTopFailureCard(it){
+  const rk = it.risk_level || "Low";
+  const riskLabel = t("risk" + rk) || it.risk_level;
+  const value = it.value == null ? "—" : `${it.value}${it.unit === "%" ? "%" : " " + it.unit}`;
+  const estimate = it.estimated_time_label || formatLong(it.estimated_time);
+  return `
+    <div class="pred-card ${rk}">
+      <div class="head">
+        <div class="thumb">${robotSvg()}</div>
+        <div>
+          <div class="id">${escapeHtml(shortenId(it.robot_id))}</div>
+          <div class="area">${escapeHtml(it.area)}</div>
+        </div>
+      </div>
+      <div class="prob-row">
+        <span class="prob" style="color:${rk==='Critical'?'var(--red)':rk==='High'?'var(--amber)':rk==='Medium'?'#a16207':'var(--green)'}">${escapeHtml(value)}</span>
+        <span class="risk-pill ${rk}">${escapeHtml(riskLabel)}</span>
+      </div>
+      <div><div class="label-sm">${escapeHtml(it.value_label || t("failureProb"))}</div></div>
+      <div><div class="label-sm">${t("predictedIssue")}</div><div class="issue">${escapeHtml(it.predicted_issue)}</div></div>
+      <div><div class="label-sm">${t("estimatedTime")}</div><div class="time">${escapeHtml(estimate)}</div></div>
+      <button class="btn-view" onclick="openRobotModal('${escapeAttr(it.robot_id)}')">${t("viewDetails")}</button>
+    </div>`;
+}
+
+function loadMoreTopFailures(){
+  state.pred.topVisible = Math.min((state.pred.topVisible || 5) + 5, (state.pred.topFailureItems || []).length);
+  renderTopFailures();
 }
 
 function renderPagination(navId, infoId, {total, page, page_size}, onGo, noun){
@@ -3215,7 +3296,7 @@ async function openRobotModal(robotId){
 function closeModal(){ document.getElementById("modalBackdrop").hidden = true; }
 
 document.addEventListener("keydown", e=>{
-  if (e.key==="Escape"){ closeModal(); closeDatePicker(); closeNotifPanel(); }
+  if (e.key==="Escape"){ closeModal(); closeDatePicker(); closeNotifPanel(); closeDegradationInfo(); }
 });
 document.getElementById("modalBackdrop").addEventListener("click", e=>{ if (e.target.id==="modalBackdrop") closeModal(); });
 document.addEventListener("click", e=>{
@@ -3223,10 +3304,24 @@ document.addEventListener("click", e=>{
   const dp = document.getElementById("datePopover");
   const np = document.getElementById("notifPanel");
   const sp = document.getElementById("settingsPopover");
+  const ip = document.getElementById("degrInfoPopover");
   if (!dp.hidden && !e.target.closest(".date-picker") && !e.target.closest("#datePopover")) dp.hidden = true;
   if (!np.hidden && !e.target.closest(".bell") && !e.target.closest("#notifPanel")) np.hidden = true;
   if (sp && !sp.hidden && !e.target.closest(".user-card") && !e.target.closest("#settingsPopover")) sp.hidden = true;
+  if (ip && !ip.hidden && !e.target.closest(".info-trigger") && !e.target.closest("#degrInfoPopover")) ip.hidden = true;
 });
+
+function toggleDegradationInfo(ev){
+  ev.stopPropagation();
+  closeDatePicker();
+  closeNotifPanel();
+  const ip = document.getElementById("degrInfoPopover");
+  if (ip) ip.hidden = !ip.hidden;
+}
+function closeDegradationInfo(){
+  const ip = document.getElementById("degrInfoPopover");
+  if (ip) ip.hidden = true;
+}
 
 // =========================================================================
 // Date picker
