@@ -2426,7 +2426,7 @@ const I18N = {
     notifications: "Notifications", markAllRead: "Mark all read",
     selectRange: "Select Date Range", predictionWindow:"Prediction Window",
     last7:"Last 7 days", last30:"Last 30 days", last90:"Last 90 days", allTime:"All time",
-    next7Days:"Next 7 Days", next30Days:"Next 30 Days", next90Days:"Next 90 Days",
+    next7Days:"Next 7 Days",
     forecastLabel:"Forecast", loadMoreRobots:"Load more", showingPredictions:"Showing {0} of {1}",
     degradationInfoTitle:"How to read this chart",
     degradationInfoBody:"The solid line is observed component risk. The dashed line is the model forecast for the fixed prediction window.",
@@ -2478,7 +2478,7 @@ const I18N = {
     notifications: "Bildirimler", markAllRead: "Tümünü okundu say",
     selectRange: "Tarih Aralığı Seç", predictionWindow:"Tahmin Penceresi",
     last7:"Son 7 gün", last30:"Son 30 gün", last90:"Son 90 gün", allTime:"Tüm zaman",
-    next7Days:"Sonraki 7 Gün", next30Days:"Sonraki 30 Gün", next90Days:"Sonraki 90 Gün",
+    next7Days:"Sonraki 7 Gün",
     forecastLabel:"Öngörü", loadMoreRobots:"Daha fazla yükle", showingPredictions:"{1} robottan {0} gösteriliyor",
     degradationInfoTitle:"Bu grafik nasıl okunur?",
     degradationInfoBody:"Düz çizgi gözlenen bileşen riskini, kesikli çizgi sabit tahmin penceresi için model öngörüsünü gösterir.",
@@ -2718,8 +2718,6 @@ function updateDateLabel(startIso, endIso){
 function predictionWindowText(days){
   const n = Number(days) || 7;
   if (n === 7) return t("next7Days");
-  if (n === 30) return t("next30Days");
-  if (n === 90) return t("next90Days");
   return currentLang === "tr" ? `Sonraki ${n} Gün` : `Next ${n} Days`;
 }
 
