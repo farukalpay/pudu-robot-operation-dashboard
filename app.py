@@ -2269,11 +2269,6 @@ body.dark .info-popover-panel{background:#111a2c;border-color:var(--border);box-
       <div class="filter-row">
         <select class="select" id="predRobotFilter"></select>
         <select class="select" id="predCategoryFilter"></select>
-        <select class="select" id="predWindowFilter">
-          <option value="7">Next 7 Days</option>
-          <option value="30">Next 30 Days</option>
-          <option value="90">Next 90 Days</option>
-        </select>
       </div>
 
       <div class="preds-row">
@@ -2543,15 +2538,6 @@ function applyLanguage(lang){
     const sentinel = sel.querySelector('option[value=""]');
     if (sentinel) sentinel.textContent = t(key);
   });
-  // Time window dropdown has numeric values; translate by value attribute
-  const wf = document.getElementById("predWindowFilter");
-  if (wf){
-    [...wf.options].forEach(o=>{
-      if (o.value === "7")  o.textContent = t("next7Days");
-      if (o.value === "30") o.textContent = t("next30Days");
-      if (o.value === "90") o.textContent = t("next90Days");
-    });
-  }
   updatePredictionWindowLabel();
   // Category option labels (Brush Motor Issues / Battery & Power / ...)
   const catKeyMap = {
@@ -2651,6 +2637,7 @@ const state = {
   notifications:{ items:[], dismissedAt:null },
 };
 let charts = {};
+const FIXED_PREDICTION_WINDOW_DAYS = 7;
 
 document.addEventListener("DOMContentLoaded", () => {
   applyTheme(currentTheme);
@@ -2738,9 +2725,9 @@ function predictionWindowText(days){
 
 function updatePredictionWindowLabel(){
   const btn = document.getElementById("predDateRange");
-  if (btn) btn.textContent = predictionWindowText(state.pred.windowDays) + " ▾";
+  if (btn) btn.textContent = predictionWindowText(FIXED_PREDICTION_WINDOW_DAYS) + " ▾";
   const pill = document.getElementById("predWindowPillValue");
-  if (pill) pill.textContent = predictionWindowText(7);
+  if (pill) pill.textContent = predictionWindowText(FIXED_PREDICTION_WINDOW_DAYS);
 }
 
 async function loadRuntime(){
@@ -3125,6 +3112,7 @@ function bindPredictionsUI(){
 }
 
 async function loadPredictions(){
+  state.pred.windowDays = FIXED_PREDICTION_WINDOW_DAYS;
   updatePredictionWindowLabel();
   await Promise.all([loadFilterOptions(), loadHeatmap(), loadDegradation(), loadPredStats(), loadTopFailures()]);
 }
@@ -3132,7 +3120,7 @@ async function loadPredictions(){
 async function loadHeatmap(){
   try{
     const params = new URLSearchParams();
-    if (state.pred.windowDays) params.set("days", state.pred.windowDays);
+    params.set("days", FIXED_PREDICTION_WINDOW_DAYS);
     if (state.pred.robot) params.set("robot_id", state.pred.robot);
     const d = await fetchJson(`/api/predictions/heatmap?${params}`);
     const grid = document.getElementById("heatmapGrid");
@@ -3182,7 +3170,7 @@ async function loadDegradation(){
     const params = new URLSearchParams();
     if (state.pred.category) params.set("category", state.pred.category);
     if (state.pred.robot) params.set("robot_id", state.pred.robot);
-    if (state.pred.windowDays) params.set("days", state.pred.windowDays);
+    params.set("days", FIXED_PREDICTION_WINDOW_DAYS);
     const d = await fetchJson(`/api/predictions/degradation?${params}`);
     renderDegradation("lstmChart", d, "#3b82f6", false);
   }catch(e){ console.error(e); }
@@ -3190,8 +3178,15 @@ async function loadDegradation(){
 
 function renderDegradation(canvasId, d, color, useRf){
   charts[canvasId]?.destroy();
-  const ctx = document.getElementById(canvasId).getContext("2d");
+  const canvas = document.getElementById(canvasId);
+  const ctx = canvas.getContext("2d");
   const predData = useRf ? d.rf_pred : d.lstm_pred;
+  const actualColor = color || "#2563eb";
+  const predictedColor = "#f97316";
+  if (typeof Chart === "undefined"){
+    renderDegradationCanvas(canvas, d.labels || [], d.actual || [], predData || [], actualColor, predictedColor);
+    return;
+  }
   charts[canvasId] = new Chart(ctx,{
     type:"line",
     data:{ labels:d.labels,
@@ -3255,14 +3250,101 @@ function renderDegradation(canvasId, d, color, useRf){
       },
     }
   });
-  if (d.predicted_failure_label){
-    document.getElementById(badgeId).innerHTML = `Predicted Failure<br><strong>${escapeHtml(d.predicted_failure_label)}</strong>`;
-  } else { document.getElementById(badgeId).textContent = "—"; }
+}
+
+function renderDegradationCanvas(canvas, labels, actual, predicted, actualColor, predictedColor){
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.max(320, Math.floor((rect.width || canvas.parentElement?.clientWidth || 640) * dpr));
+  const height = Math.max(220, Math.floor((rect.height || canvas.parentElement?.clientHeight || 300) * dpr));
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, width, height);
+  ctx.save();
+  ctx.scale(dpr, dpr);
+
+  const w = width / dpr;
+  const h = height / dpr;
+  const pad = {top: 34, right: 18, bottom: 34, left: 42};
+  const plotW = Math.max(1, w - pad.left - pad.right);
+  const plotH = Math.max(1, h - pad.top - pad.bottom);
+  const xFor = i => pad.left + (labels.length <= 1 ? 0 : (i * plotW / (labels.length - 1)));
+  const yFor = v => pad.top + plotH - (Math.max(0, Math.min(100, Number(v) || 0)) * plotH / 100);
+
+  ctx.strokeStyle = "#eef2f7";
+  ctx.lineWidth = 1;
+  ctx.fillStyle = "#94a3b8";
+  ctx.font = "10px Inter, system-ui, sans-serif";
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  [0, 25, 50, 75, 100].forEach(v => {
+    const y = yFor(v);
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(w - pad.right, y);
+    ctx.stroke();
+    ctx.fillText(String(v), pad.left - 8, y);
+  });
+
+  function drawLine(values, stroke, dashed){
+    ctx.save();
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.setLineDash(dashed ? [6, 4] : []);
+    let started = false;
+    values.forEach((value, i) => {
+      if (value === null || value === undefined || Number.isNaN(Number(value))){
+        if (!dashed) started = false;
+        return;
+      }
+      const x = xFor(i);
+      const y = yFor(value);
+      if (!started){
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
+    });
+    if (started) ctx.stroke();
+    ctx.restore();
+  }
+
+  drawLine(actual, actualColor, false);
+  drawLine(predicted, predictedColor, true);
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  const labelStep = Math.max(1, Math.ceil(labels.length / 6));
+  labels.forEach((label, i) => {
+    if (i % labelStep === 0 || i === labels.length - 1) ctx.fillText(label, xFor(i), h - pad.bottom + 12);
+  });
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = actualColor;
+  ctx.fillRect(w - 150, 13, 24, 2);
+  ctx.fillStyle = "#334155";
+  ctx.font = "11px Inter, system-ui, sans-serif";
+  ctx.fillText(t("legendActual") || "Actual", w - 120, 14);
+  ctx.strokeStyle = predictedColor;
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  ctx.moveTo(w - 68, 14);
+  ctx.lineTo(w - 44, 14);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillText(t("legendPredicted") || "Predicted", w - 38, 14);
+  ctx.restore();
 }
 
 async function loadPredStats(){
   try{
-    const params = new URLSearchParams({days: state.pred.windowDays || 7});
+    const params = new URLSearchParams({days: FIXED_PREDICTION_WINDOW_DAYS});
     if (state.pred.robot) params.set("robot_id", state.pred.robot);
     // Forward the top-filter category so High Severity / Predicted Failures
     // respond to the dropdown choice. Backend just ignores the param when
@@ -3520,9 +3602,7 @@ function applyQuickRange(value){
 }
 
 function applyFutureRange(days){
-  state.pred.windowDays = Number(days) || 7;
-  const wf = document.getElementById("predWindowFilter");
-  if (wf) wf.value = String(state.pred.windowDays);
+  state.pred.windowDays = FIXED_PREDICTION_WINDOW_DAYS;
   closeDatePicker();
   updatePredictionWindowLabel();
   loadPredictions();
