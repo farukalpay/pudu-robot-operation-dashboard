@@ -704,8 +704,9 @@ def api_fault_list(
             except ValueError:
                 pass
         if search:
-            # Renamed to "Search robot ID" in the UI: now only matches robot_id.
-            sql += " AND COALESCE(robot_id,'') ILIKE %s"
+            # The search box now reads "Search Error ID..." and filters
+            # against error_id only.
+            sql += " AND COALESCE(error_id,'') ILIKE %s"
             params.append(f"%{search}%")
         if robot and robot.lower() not in ("all", "all robots"):
             sql += " AND robot_id = %s"; params.append(robot)
@@ -1782,6 +1783,10 @@ body.dark .head-select{background-color:#172238;color:var(--text);border-color:v
 /* Selected-head summary card lives INSIDE the Robot-Level Head Outputs
    section, just under the title row, so trim its outer margin. */
 .selected-head-card{margin-bottom:18px}
+/* Head name (Instant Fault Detection etc.) is now the headline of this
+   card, so the numeric value's 30px font would overflow. Trim it. */
+.selected-head-card .stat-value{font-size:22px;line-height:1.2;word-break:break-word}
+.selected-head-card .stat-sub{font-size:12.5px;color:var(--text-mute)}
 .stat-value{font-size:30px;font-weight:700;line-height:1.1}
 .stat-sub{font-size:12px;color:var(--text-mute);margin-top:2px}
 .stat-trend{text-align:right}
@@ -2217,7 +2222,7 @@ body.dark .info-popover-panel{background:#111a2c;border-color:var(--border);box-
       <div class="filter-row">
         <div class="search" style="flex:1;min-width:180px">
           <span class="search-icon">🔎</span>
-          <input type="search" id="fhSearch" placeholder="Search robot ID..." data-i18n-ph="searchRobot" />
+          <input type="search" id="fhSearch" placeholder="Search Error ID..." data-i18n-ph="searchErrorId" />
         </div>
         <select class="select" id="fhRobotFilter"></select>
         <select class="select" id="fhFaultFilter"></select>
@@ -2420,7 +2425,7 @@ const I18N = {
     faultHistoryTitle: "Fault History", faultHistorySub: "Browse and analyze historical faults and system issues",
     settings: "Settings", language: "Language", theme: "Theme", lightMode:"Light", darkMode:"Dark",
     systemStatus: "System Status", allSystemsOperational: "All Systems Operational",
-    vsPrev:"vs prev period", searchFaults:"Search faults...",
+    vsPrev:"vs prev period", searchFaults:"Search faults...", searchErrorId:"Search Error ID...",
     noRobots:"No robots found", noFaults:"No faults match the filters", noAlerts:"No active alerts",
     showing: "Showing", to: "to", of: "of", robots: "robots", faults: "faults",
     notifications: "Notifications", markAllRead: "Mark all read",
@@ -2472,7 +2477,7 @@ const I18N = {
     faultHistoryTitle: "Arıza Geçmişi", faultHistorySub: "Tarihsel arızaları ve sistem sorunlarını incele",
     settings: "Ayarlar", language: "Dil", theme: "Tema", lightMode:"Aydınlık", darkMode:"Karanlık",
     systemStatus: "Sistem Durumu", allSystemsOperational: "Tüm Sistemler Çalışıyor",
-    vsPrev:"önceki döneme göre", searchFaults:"Arıza ara...",
+    vsPrev:"önceki döneme göre", searchFaults:"Arıza ara...", searchErrorId:"Hata ID ara...",
     noRobots:"Robot bulunamadı", noFaults:"Filtrelere uyan arıza yok", noAlerts:"Aktif uyarı yok",
     showing:"Gösteriliyor", to:"-", of:"/", robots:"robot", faults:"arıza",
     notifications: "Bildirimler", markAllRead: "Tümünü okundu say",
@@ -3364,13 +3369,19 @@ function renderModelHeadCard(){
     return;
   }
   const cur = heads[state.pred.head] || heads["1"];
-  const display = cur.value == null ? "—" : (cur.unit === "%" ? `${cur.value}%` : `${cur.value} ${cur.unit}`);
+  // Swap: the head name (Instant Fault Detection / Fault Severity /
+  // 7-Day Forecast / Fault ETA) is now the BIG headline; the numeric
+  // value + unit join the metric description on the secondary line
+  // (eg "29 robots · Accuracy / F1 / AUC · %99.4 / %94.8 / %99.9").
+  const label = t(cur.label_key) || cur.label_key;
+  const numeric = cur.value == null
+    ? "—"
+    : (cur.unit === "%" ? `${cur.value}%` : `${cur.value} ${cur.unit}`);
   const barPct = cur.bar_pct ?? (cur.unit === "%" ? cur.value : 0);
-  setPredCard("predAcc","predAccTrend","predAccBar", display, null, barPct);
+  setPredCard("predAcc","predAccTrend","predAccBar", label, null, barPct);
   const hint = document.getElementById("predHeadHint");
   if (hint){
-    const label = t(cur.label_key) || cur.label_key;
-    hint.textContent = cur.metric_text ? `${label} · ${cur.metric_text}` : label;
+    hint.textContent = cur.metric_text ? `${numeric} · ${cur.metric_text}` : numeric;
   }
 }
 
