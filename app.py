@@ -704,8 +704,9 @@ def api_fault_list(
             except ValueError:
                 pass
         if search:
-            # Renamed to "Search robot ID" in the UI: now only matches robot_id.
-            sql += " AND COALESCE(robot_id,'') ILIKE %s"
+            # The search box now reads "Search Error ID..." and filters
+            # against error_id only.
+            sql += " AND COALESCE(error_id,'') ILIKE %s"
             params.append(f"%{search}%")
         if robot and robot.lower() not in ("all", "all robots"):
             sql += " AND robot_id = %s"; params.append(robot)
@@ -1781,7 +1782,39 @@ body.dark .head-select{background-color:#172238;color:var(--text);border-color:v
 .section-head-with-select h3{margin:0;font-size:15px;font-weight:600}
 /* Selected-head summary card lives INSIDE the Robot-Level Head Outputs
    section, just under the title row, so trim its outer margin. */
-.selected-head-card{margin-bottom:18px}
+.selected-head-card{margin-bottom:18px;overflow:visible}
+/* The .stat base class clips children with overflow:hidden so that the
+   bottom progress bar follows the card's rounded corners. The (ⓘ) tooltip
+   bubble lives below the title row and was getting clipped at the card
+   edge — so this card opts out of clipping and we explicitly round the
+   stat-bar to keep the bottom edge looking right. */
+.selected-head-card .stat-bar{border-bottom-left-radius:var(--radius);border-bottom-right-radius:var(--radius);overflow:hidden}
+/* Title row of the selected-head card: "Model Accuracy · Instant Fault
+   Detection (ⓘ)". Model Accuracy is a bit bolder than the other lines so
+   it stands out as the card label. */
+.selected-head-card .stat-title-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.selected-head-card .model-accuracy-label{font-size:13.5px;font-weight:700;color:var(--text)}
+.selected-head-card .title-sep{color:var(--text-mute);font-weight:400}
+.selected-head-card .head-name-label{font-size:13px;font-weight:600;color:var(--text)}
+/* BIG line is now the actual metric values (eg "%99.4 / %94.8 / %99.9").
+   Keep it readable without overflowing when the value contains slashes. */
+.selected-head-card .stat-value{font-size:24px;line-height:1.2;word-break:break-word;
+  font-variant-numeric:tabular-nums;margin-top:2px}
+.selected-head-card .stat-sub{font-size:12.5px;color:var(--text-mute)}
+/* Info tooltip (ⓘ) — hover or focus pops a bubble explaining the metrics. */
+.info-tip{position:relative;display:inline-flex;align-items:center;justify-content:center;
+  width:18px;height:18px;border-radius:50%;color:var(--text-mute);
+  font-size:12px;cursor:help;line-height:1;user-select:none;outline:none}
+.info-tip:hover,.info-tip:focus-visible{color:var(--primary)}
+.info-tip-bubble{position:absolute;top:calc(100% + 8px);left:50%;transform:translateX(-50%);
+  background:#1f2937;color:#fff;font-size:11.5px;line-height:1.4;
+  padding:10px 12px;border-radius:8px;width:max-content;max-width:260px;
+  box-shadow:0 10px 24px rgba(15,23,42,.25);opacity:0;pointer-events:none;
+  transition:opacity .15s;z-index:20;font-weight:400;text-align:left;white-space:normal}
+.info-tip:hover .info-tip-bubble,.info-tip:focus-visible .info-tip-bubble{opacity:1}
+.info-tip-bubble::before{content:"";position:absolute;bottom:100%;left:50%;
+  transform:translateX(-50%);border:6px solid transparent;border-bottom-color:#1f2937}
+body.dark .info-tip-bubble{background:#0f172a}
 .stat-value{font-size:30px;font-weight:700;line-height:1.1}
 .stat-sub{font-size:12px;color:var(--text-mute);margin-top:2px}
 .stat-trend{text-align:right}
@@ -2217,7 +2250,7 @@ body.dark .info-popover-panel{background:#111a2c;border-color:var(--border);box-
       <div class="filter-row">
         <div class="search" style="flex:1;min-width:180px">
           <span class="search-icon">🔎</span>
-          <input type="search" id="fhSearch" placeholder="Search robot ID..." data-i18n-ph="searchRobot" />
+          <input type="search" id="fhSearch" placeholder="Search Error ID..." data-i18n-ph="searchErrorId" />
         </div>
         <select class="select" id="fhRobotFilter"></select>
         <select class="select" id="fhFaultFilter"></select>
@@ -2342,7 +2375,14 @@ body.dark .info-popover-panel{background:#111a2c;border-color:var(--border);box-
         <div class="card stat selected-head-card">
           <div class="stat-icon icon-purple"><svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M8 12l2.5 2.5L16 9"></path></svg></div>
           <div class="stat-body">
-            <div class="stat-title"><span data-i18n="modelAccuracy">Model Accuracy</span></div>
+            <div class="stat-title stat-title-row">
+              <span class="model-accuracy-label" data-i18n="modelAccuracy">Model Accuracy</span>
+              <span class="title-sep">·</span>
+              <span class="head-name-label" id="predHeadName">Instant Fault Detection</span>
+              <span class="info-tip" id="predHeadInfo" tabindex="0" aria-label="info">ⓘ
+                <span class="info-tip-bubble" id="predHeadInfoBubble"></span>
+              </span>
+            </div>
             <div class="stat-value" id="predAcc">—%</div>
             <div class="stat-sub" id="predHeadHint"></div>
           </div>
@@ -2420,7 +2460,7 @@ const I18N = {
     faultHistoryTitle: "Fault History", faultHistorySub: "Browse and analyze historical faults and system issues",
     settings: "Settings", language: "Language", theme: "Theme", lightMode:"Light", darkMode:"Dark",
     systemStatus: "System Status", allSystemsOperational: "All Systems Operational",
-    vsPrev:"vs prev period", searchFaults:"Search faults...",
+    vsPrev:"vs prev period", searchFaults:"Search faults...", searchErrorId:"Search Error ID...",
     noRobots:"No robots found", noFaults:"No faults match the filters", noAlerts:"No active alerts",
     showing: "Showing", to: "to", of: "of", robots: "robots", faults: "faults",
     notifications: "Notifications", markAllRead: "Mark all read",
@@ -2454,6 +2494,10 @@ const I18N = {
     head1Label:"Instant Fault Detection", head2Label:"Fault Severity",
     head3Label:"Future Forecast", head4Label:"Fault ETA",
     metricAccuracy:"Accuracy", metricAuc:"AUC-ROC", metricMae:"MAE",
+    headTip1: "Instant fault detection metrics. Accuracy = correct prediction rate, F1 = precision + recall balance, AUC = how well the model separates failing from healthy robots. Higher is better.",
+    headTip2: "Fault severity classification accuracy across four levels (Event / Warning / Error / Fatal).",
+    headTip3: "AUC-ROC of the 7-day failure forecast. 1.0 = perfect separation, 0.5 = random guessing.",
+    headTip4: "Mean Absolute Error of the fault-ETA regression head, expressed in hours. Lower is better — it tells you how far the predicted time-to-failure is off on average.",
   },
   tr: {
     navDashboard: "Gösterge Paneli", navPredictions: "Tahminler & Analiz", navFaultHistory: "Arıza Geçmişi",
@@ -2472,7 +2516,7 @@ const I18N = {
     faultHistoryTitle: "Arıza Geçmişi", faultHistorySub: "Tarihsel arızaları ve sistem sorunlarını incele",
     settings: "Ayarlar", language: "Dil", theme: "Tema", lightMode:"Aydınlık", darkMode:"Karanlık",
     systemStatus: "Sistem Durumu", allSystemsOperational: "Tüm Sistemler Çalışıyor",
-    vsPrev:"önceki döneme göre", searchFaults:"Arıza ara...",
+    vsPrev:"önceki döneme göre", searchFaults:"Arıza ara...", searchErrorId:"Hata ID ara...",
     noRobots:"Robot bulunamadı", noFaults:"Filtrelere uyan arıza yok", noAlerts:"Aktif uyarı yok",
     showing:"Gösteriliyor", to:"-", of:"/", robots:"robot", faults:"arıza",
     notifications: "Bildirimler", markAllRead: "Tümünü okundu say",
@@ -2506,6 +2550,10 @@ const I18N = {
     head1Label:"Anlık Arıza Tespiti", head2Label:"Arıza Şiddeti",
     head3Label:"Gelecek Öngörüsü", head4Label:"Arıza Süresi",
     metricAccuracy:"Doğruluk", metricAuc:"AUC-ROC", metricMae:"Ortalama Hata",
+    headTip1: "Anlık arıza tespitinin doğruluk metrikleri. Accuracy = doğru tahmin oranı, F1 = precision + recall dengesi, AUC = modelin arızalı/sağlıklı ayırt etme gücü. Değer yüksek olursa iyi.",
+    headTip2: "Arıza şiddeti sınıflandırması (Event / Warning / Error / Fatal — 4 seviye) doğruluğu.",
+    headTip3: "7 günlük arıza olasılık tahmininin AUC-ROC değeri. 1.0 = kusursuz, 0.5 = rastgele tahmin.",
+    headTip4: "Arıza süresi regresyon head'inin MAE (Ortalama Mutlak Hata) değeri, saat cinsinden. Daha düşük daha iyi — tahmin edilen zamanın gerçek değerden ortalama sapması.",
   }
 };
 let currentLang = localStorage.getItem("lang") || "en";
@@ -3364,13 +3412,45 @@ function renderModelHeadCard(){
     return;
   }
   const cur = heads[state.pred.head] || heads["1"];
-  const display = cur.value == null ? "—" : (cur.unit === "%" ? `${cur.value}%` : `${cur.value} ${cur.unit}`);
+  const headName = t(cur.label_key) || cur.label_key;
+  const numeric = cur.value == null
+    ? "—"
+    : (cur.unit === "%" ? `${cur.value}%` : `${cur.value} ${cur.unit}`);
+  // metric_text comes back as "Accuracy / F1 / AUC · %99.4 / %94.8 / %99.9"
+  // — split it so the values can become the headline of the card and the
+  // metric NAMES move into the small sub line.
+  let metricNames = "", metricValues = "";
+  if (cur.metric_text){
+    const idx = cur.metric_text.indexOf(" · ");
+    if (idx > -1){
+      metricNames = cur.metric_text.slice(0, idx);
+      metricValues = cur.metric_text.slice(idx + 3);
+    } else {
+      metricValues = cur.metric_text;
+    }
+  }
+  const headline = metricValues || numeric;
   const barPct = cur.bar_pct ?? (cur.unit === "%" ? cur.value : 0);
-  setPredCard("predAcc","predAccTrend","predAccBar", display, null, barPct);
+  setPredCard("predAcc","predAccTrend","predAccBar", headline, null, barPct);
+
+  // Title row: "Model Accuracy · <head name> (ⓘ)"
+  const headNameEl = document.getElementById("predHeadName");
+  if (headNameEl) headNameEl.textContent = headName;
+
+  // Sub line under the big value: "29 robots · Accuracy / F1 / AUC"
   const hint = document.getElementById("predHeadHint");
   if (hint){
-    const label = t(cur.label_key) || cur.label_key;
-    hint.textContent = cur.metric_text ? `${label} · ${cur.metric_text}` : label;
+    const parts = [];
+    if (numeric && numeric !== "—") parts.push(numeric);
+    if (metricNames) parts.push(metricNames);
+    hint.textContent = parts.join(" · ");
+  }
+
+  // Info tooltip: explanation of what metrics mean for this head
+  const bubble = document.getElementById("predHeadInfoBubble");
+  if (bubble){
+    const tipKey = "headTip" + state.pred.head;
+    bubble.textContent = t(tipKey) || "";
   }
 }
 
