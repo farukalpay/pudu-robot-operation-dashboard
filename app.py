@@ -929,13 +929,22 @@ def api_pred_degradation(
                     continue
                 future_by_day.setdefault(r["bkt"], set()).add(r["robot_id"])
             denominator = 1 if robot_id and robot_id.lower() not in ("", "all", "all robots") else max(1, len(active_robots))
-            for day in sorted(future_by_day.keys()):
+            # Replay mode still represents a forecast outcome when no failure
+            # occurs. Return zero-valued days as well as failure days so the
+            # predicted series does not disappear for a healthy window.
+            for day in _bucket_keys(reference, observed_end, "day"):
                 future_labels.append(day.strftime("%b %d"))
-                future_values.append(round(len(future_by_day[day]) * 100 / denominator, 1))
+                future_values.append(round(len(future_by_day.get(day, set())) * 100 / denominator, 1))
 
         labels = labels[-14:]
         actual = actual[-14:]
-        lstm_pred = [None] * len(actual) + future_values
+        # Anchor a forecast at the last observed point. Without this anchor,
+        # an engine forecast containing one future value has no line segment
+        # for Chart.js to render and appears missing from the chart.
+        forecast_prefix = [None] * len(actual)
+        if actual and future_values:
+            forecast_prefix[-1] = actual[-1]
+        lstm_pred = forecast_prefix + future_values
         rf_pred = list(lstm_pred)
 
         return {
@@ -1710,8 +1719,10 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
    read like the user's paint mock-up. */
 .heatmap.cols{display:grid;gap:4px;width:100%;position:relative}
 .heatmap.cols .hrow{display:grid;gap:6px;align-items:center}
-.heatmap.cols .hcell{position:relative;height:24px;border-radius:5px;background:transparent}
-.heatmap.cols .hcell .fill{position:absolute;inset:0;border-radius:5px;z-index:1}
+.heatmap.cols .hcell{position:relative;height:24px;border-radius:5px;background:transparent;cursor:help}
+.heatmap.cols .hcell:hover,.heatmap.cols .hcell:focus{z-index:46}
+.heatmap.cols .hcell:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+.heatmap.cols .hcell .fill{position:absolute;inset:0;border-radius:5px;z-index:1;pointer-events:none}
 .heatmap.cols .rlabel{font-size:12px;font-weight:600;color:var(--text);
   padding-right:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .heatmap.cols .hlabel{font-size:10.5px;color:var(--text-mute);text-align:left;
@@ -1977,7 +1988,7 @@ body.dark .mono-id{background:#172238;color:var(--text)}
 .cat-legend li{display:flex;align-items:center;font-size:12.5px;gap:8px;color:var(--text)}
 .cat-legend .dot{width:9px;height:9px;border-radius:50%}
 
-.heat-card,.degr-card{padding:20px}
+.heat-card,.degr-card{padding:20px;position:relative}
 .degr-card{position:relative}
 .preds-row{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}
 .heatmap{display:grid;gap:6px;align-items:center;margin-top:10px}
@@ -1991,6 +2002,14 @@ body.dark .mono-id{background:#172238;color:var(--text)}
   color:var(--text-mute);margin-left:10px}
 .heat-legend .bar{width:14px;height:100px;border-radius:6px;
   background:linear-gradient(180deg,#ef4444,#f59e0b,#10b981)}
+.heatmap-tooltip{display:none;position:absolute;z-index:45;left:50%;bottom:calc(100% + 8px);
+  transform:translateX(-50%);min-width:148px;padding:9px 11px;white-space:nowrap;
+  background:#1f2937;color:#fff;border-radius:8px;box-shadow:0 10px 25px rgba(15,23,42,.22);
+  font-size:11.5px;line-height:1.45;pointer-events:none}
+.heatmap.cols .hcell:hover .heatmap-tooltip,.heatmap.cols .hcell:focus .heatmap-tooltip{display:block}
+.heatmap.cols .hrow:first-child .heatmap-tooltip{bottom:auto;top:calc(100% + 8px)}
+.heatmap-tooltip strong{display:block;font-size:12px;margin-bottom:2px}
+.heatmap-tooltip .risk{font-weight:700}
 
 .degr-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:10px}
 .degr-grid .mini{position:relative;height:220px}
@@ -2039,6 +2058,7 @@ body.dark .mono-id{background:#172238;color:var(--text)}
 .pred-load-more .count{font-size:12px;color:var(--text-mute)}
 body.dark .info-trigger{background:#172238;color:#93c5fd;border-color:var(--border)}
 body.dark .info-popover-panel{background:#111a2c;border-color:var(--border);box-shadow:0 16px 38px rgba(0,0,0,.45)}
+body.dark .heatmap-tooltip{background:#020617}
 
 	@media (max-width:1100px){.charts,.preds-row,.runtime-strip{grid-template-columns:1fr}
   .donut-wrap{flex-wrap:wrap}
@@ -2307,7 +2327,18 @@ body.dark .info-popover-panel{background:#111a2c;border-color:var(--border);box-
       <div class="preds-row">
         <div class="card heat-card">
           <div class="chart-head">
-            <h3 data-i18n="fleetRiskHeatmap">Fleet Risk Assessment Heatmap</h3>
+            <div class="title-with-info">
+              <h3 data-i18n="fleetRiskHeatmap">Fleet Risk Assessment Heatmap</h3>
+              <button class="info-trigger" type="button" aria-label="How to read this heatmap" onclick="toggleHeatmapInfo(event)">i</button>
+            </div>
+          </div>
+          <div class="info-popover-panel" id="heatInfoPopover" hidden onclick="event.stopPropagation()">
+            <h4 data-i18n="heatmapInfoTitle">How to read this heatmap</h4>
+            <p data-i18n="heatmapInfoBody">Each cell is an observed fault-risk score for one robot in the displayed lookback period.</p>
+            <ul>
+              <li data-i18n="heatmapInfoColor">Green indicates lower risk; orange and red indicate increasing maintenance priority.</li>
+              <li data-i18n="heatmapInfoHover">Hover or focus a cell to see its robot, period, and risk score.</li>
+            </ul>
           </div>
           <div style="display:flex;gap:12px;align-items:flex-end">
             <div class="heatmap cols" id="heatmapGrid" style="flex:1"></div>
@@ -2468,6 +2499,11 @@ const I18N = {
     last7:"Last 7 days", last30:"Last 30 days", last90:"Last 90 days", allTime:"All time",
     next7Days:"Next 7 Days",
     forecastLabel:"Forecast", loadMoreRobots:"Load more", showingPredictions:"Showing {0} of {1}",
+    heatmapInfoTitle:"How to read this heatmap",
+    heatmapInfoBody:"Each cell is an observed fault-risk score for one robot in the displayed lookback period.",
+    heatmapInfoColor:"Green indicates lower risk; orange and red indicate increasing maintenance priority.",
+    heatmapInfoHover:"Hover or focus a cell to see its robot, period, and risk score.",
+    heatmapRiskScore:"Risk score",
     degradationInfoTitle:"How to read this chart",
     degradationInfoBody:"The solid line is observed component risk. The dashed line is the model forecast for the fixed prediction window.",
     degradationInfoLow:"Low and flat values mean the component is stable.",
@@ -2524,6 +2560,11 @@ const I18N = {
     last7:"Son 7 gün", last30:"Son 30 gün", last90:"Son 90 gün", allTime:"Tüm zaman",
     next7Days:"Sonraki 7 Gün",
     forecastLabel:"Öngörü", loadMoreRobots:"Daha fazla yükle", showingPredictions:"{1} robottan {0} gösteriliyor",
+    heatmapInfoTitle:"Bu risk haritası nasıl okunur?",
+    heatmapInfoBody:"Her hücre, gösterilen geçmiş dönemde bir robot için gözlenen arıza risk puanını gösterir.",
+    heatmapInfoColor:"Yeşil düşük riski; turuncu ve kırmızı artan bakım önceliğini belirtir.",
+    heatmapInfoHover:"Robotu, dönemi ve risk puanını görmek için hücrenin üzerine gelin veya odaklayın.",
+    heatmapRiskScore:"Risk puanı",
     degradationInfoTitle:"Bu grafik nasıl okunur?",
     degradationInfoBody:"Düz çizgi gözlenen bileşen riskini, kesikli çizgi sabit tahmin penceresi için model öngörüsünü gösterir.",
     degradationInfoLow:"Düşük ve yatay değerler bileşenin stabil olduğunu gösterir.",
@@ -3181,8 +3222,13 @@ async function loadHeatmap(){
     const rows = d.robot_ids.map((rid,i)=>{
       const cells = d.weeks.map((w, j)=>{
         const v = d.grid[i][j];
-        return `<div class="hcell" title="${escapeAttr(w)}: ${v}%">
+        const tooltipLabel = `${shortenId(rid)} · ${w} · ${t("heatmapRiskScore")}: ${v}%`;
+        return `<div class="hcell" tabindex="0" aria-label="${escapeAttr(tooltipLabel)}">
                   <span class="fill" style="background:${riskColor(v)}"></span>
+                  <span class="heatmap-tooltip" role="tooltip">
+                    <strong>${escapeHtml(shortenId(rid))}</strong>
+                    ${escapeHtml(w)} · <span class="risk">${escapeHtml(t("heatmapRiskScore"))}: ${escapeHtml(v)}%</span>
+                  </span>
                 </div>`;
       }).join("");
       return `<div class="hrow" style="grid-template-columns:${cols}">
@@ -3254,7 +3300,7 @@ function renderDegradation(canvasId, d, color, useRf){
           borderWidth: 2.5,
           borderDash: [6, 4],
           tension: 0.35,
-          pointRadius: 0,
+          pointRadius: context => context.dataIndex >= d.actual.length ? 3 : 0,
           pointHoverRadius: 4,
           pointHitRadius: 8,
           spanGaps: true },
@@ -3333,7 +3379,7 @@ function renderDegradationCanvas(canvas, labels, actual, predicted, actualColor,
     ctx.fillText(String(v), pad.left - 8, y);
   });
 
-  function drawLine(values, stroke, dashed){
+  function drawLine(values, stroke, dashed, showPoints){
     ctx.save();
     ctx.strokeStyle = stroke;
     ctx.lineWidth = 2.5;
@@ -3341,6 +3387,7 @@ function renderDegradationCanvas(canvas, labels, actual, predicted, actualColor,
     ctx.lineCap = "round";
     ctx.setLineDash(dashed ? [6, 4] : []);
     let started = false;
+    const points = [];
     values.forEach((value, i) => {
       if (value === null || value === undefined || Number.isNaN(Number(value))){
         if (!dashed) started = false;
@@ -3348,6 +3395,7 @@ function renderDegradationCanvas(canvas, labels, actual, predicted, actualColor,
       }
       const x = xFor(i);
       const y = yFor(value);
+      points.push({x, y});
       if (!started){
         ctx.beginPath();
         ctx.moveTo(x, y);
@@ -3357,11 +3405,20 @@ function renderDegradationCanvas(canvas, labels, actual, predicted, actualColor,
       }
     });
     if (started) ctx.stroke();
+    if (showPoints){
+      ctx.setLineDash([]);
+      ctx.fillStyle = stroke;
+      points.forEach(({x, y}) => {
+        ctx.beginPath();
+        ctx.arc(x, y, 3, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    }
     ctx.restore();
   }
 
-  drawLine(actual, actualColor, false);
-  drawLine(predicted, predictedColor, true);
+  drawLine(actual, actualColor, false, false);
+  drawLine(predicted, predictedColor, true, true);
 
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
@@ -3585,7 +3642,7 @@ async function openRobotModal(robotId){
 function closeModal(){ document.getElementById("modalBackdrop").hidden = true; }
 
 document.addEventListener("keydown", e=>{
-  if (e.key==="Escape"){ closeModal(); closeDatePicker(); closeNotifPanel(); closeDegradationInfo(); }
+  if (e.key==="Escape"){ closeModal(); closeDatePicker(); closeNotifPanel(); closePredictionInfo(); }
 });
 document.getElementById("modalBackdrop").addEventListener("click", e=>{ if (e.target.id==="modalBackdrop") closeModal(); });
 document.addEventListener("click", e=>{
@@ -3593,23 +3650,35 @@ document.addEventListener("click", e=>{
   const dp = document.getElementById("datePopover");
   const np = document.getElementById("notifPanel");
   const sp = document.getElementById("settingsPopover");
-  const ip = document.getElementById("degrInfoPopover");
+  const heatInfo = document.getElementById("heatInfoPopover");
+  const degrInfo = document.getElementById("degrInfoPopover");
   if (!dp.hidden && !e.target.closest(".date-picker") && !e.target.closest("#datePopover")) dp.hidden = true;
   if (!np.hidden && !e.target.closest(".bell") && !e.target.closest("#notifPanel")) np.hidden = true;
   if (sp && !sp.hidden && !e.target.closest(".user-card") && !e.target.closest("#settingsPopover")) sp.hidden = true;
-  if (ip && !ip.hidden && !e.target.closest(".info-trigger") && !e.target.closest("#degrInfoPopover")) ip.hidden = true;
+  if (heatInfo && !heatInfo.hidden && !e.target.closest(".info-trigger") && !e.target.closest("#heatInfoPopover")) heatInfo.hidden = true;
+  if (degrInfo && !degrInfo.hidden && !e.target.closest(".info-trigger") && !e.target.closest("#degrInfoPopover")) degrInfo.hidden = true;
 });
 
-function toggleDegradationInfo(ev){
+function togglePredictionInfo(id, ev){
   ev.stopPropagation();
   closeDatePicker();
   closeNotifPanel();
-  const ip = document.getElementById("degrInfoPopover");
-  if (ip) ip.hidden = !ip.hidden;
+  const panel = document.getElementById(id);
+  const shouldOpen = panel && panel.hidden;
+  closePredictionInfo();
+  if (panel) panel.hidden = !shouldOpen;
 }
-function closeDegradationInfo(){
-  const ip = document.getElementById("degrInfoPopover");
-  if (ip) ip.hidden = true;
+function toggleHeatmapInfo(ev){
+  togglePredictionInfo("heatInfoPopover", ev);
+}
+function toggleDegradationInfo(ev){
+  togglePredictionInfo("degrInfoPopover", ev);
+}
+function closePredictionInfo(){
+  ["heatInfoPopover", "degrInfoPopover"].forEach(id=>{
+    const panel = document.getElementById(id);
+    if (panel) panel.hidden = true;
+  });
 }
 
 // =========================================================================
