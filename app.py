@@ -1782,7 +1782,13 @@ body.dark .head-select{background-color:#172238;color:var(--text);border-color:v
 .section-head-with-select h3{margin:0;font-size:15px;font-weight:600}
 /* Selected-head summary card lives INSIDE the Robot-Level Head Outputs
    section, just under the title row, so trim its outer margin. */
-.selected-head-card{margin-bottom:18px}
+.selected-head-card{margin-bottom:18px;overflow:visible}
+/* The .stat base class clips children with overflow:hidden so that the
+   bottom progress bar follows the card's rounded corners. The (ⓘ) tooltip
+   bubble lives below the title row and was getting clipped at the card
+   edge — so this card opts out of clipping and we explicitly round the
+   stat-bar to keep the bottom edge looking right. */
+.selected-head-card .stat-bar{border-bottom-left-radius:var(--radius);border-bottom-right-radius:var(--radius);overflow:hidden}
 /* Title row of the selected-head card: "Model Accuracy · Instant Fault
    Detection (ⓘ)". Model Accuracy is a bit bolder than the other lines so
    it stands out as the card label. */
