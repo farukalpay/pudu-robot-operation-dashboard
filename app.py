@@ -237,6 +237,23 @@ def _classify_status(error_level: str | None, hourly_ratio: float | None = None)
     return "Normal"
 
 
+def _fault_age_days(task_time: datetime | None, reference: datetime) -> int:
+    if task_time is None:
+        return 0
+    if task_time.tzinfo is not None:
+        task_time = task_time.replace(tzinfo=None)
+    return max(0, (reference - task_time).days)
+
+
+def _is_unresolved_fault(
+    error_level: str | None,
+    hourly_ratio: float | None,
+    task_time: datetime | None,
+    reference: datetime,
+) -> bool:
+    return _classify_status(error_level, hourly_ratio) == "Critical" and _fault_age_days(task_time, reference) < 30
+
+
 def _status_code(error_level: str | None, prob: float, forecast: float = 0.0) -> str:
     """DrGb24-style status codes used by the dashboard table & i18n labels.
 
@@ -762,9 +779,7 @@ def api_fault_list(
             mins = int((r["hourly_error_count"] or 1) * 8)
             downtime = f"{mins // 60}h {mins % 60:02d}m" if mins >= 60 else f"{mins}m"
             tt = r["task_time"]
-            if isinstance(tt, datetime) and tt.tzinfo is not None: tt = tt.replace(tzinfo=None)
-            age_days = (win_end - tt).days if tt else 0
-            resolution = "In Progress" if (st == "Critical" and age_days < 30) else "Resolved"
+            resolution = "In Progress" if _is_unresolved_fault(r["error_level"], r["hourly_ratio"], tt, win_end) else "Resolved"
             items.append({
                 "task_time": r["task_time"].isoformat() if r["task_time"] else None,
                 "robot_id": r["robot_id"] or "",
@@ -1368,19 +1383,28 @@ def _head_rows(
             active_error_types = prediction.get("active_error_types") or []
             error_details = prediction.get("error_details") or []
             source = snapshot.engine_kind or "model_inference"
+            fault_history_resolved = (
+                current_failure
+                and not _is_unresolved_fault(r["error_level"], r["hourly_ratio"], r["task_time"], reference)
+            )
         else:
             severity_score = MODEL_RUNTIME.severity_score(r["error_level"])
             severity_label = snapshot.severity_labels.get(severity_score, r["error_level"] or "Unknown") if severity_score is not None else (r["error_level"] or "Unknown")
             severity_tr = snapshot.severity_labels_tr.get(severity_score, severity_label) if severity_score is not None else severity_label
-            current_failure = MODEL_RUNTIME.is_failure_level(r["error_level"])
+            current_failure = _is_unresolved_fault(r["error_level"], r["hourly_ratio"], r["task_time"], reference)
             future_failure = bool(future)
-            evidence_ratio = float(r["hourly_ratio"] or 0)
+            evidence_ratio = float(r["hourly_ratio"] or 0) if current_failure else 0.0
             future_ratio = 1.0 if future_failure else 0.0
             hours_to_failure = hours_to_failure
-            active_error_types = [r["error_type"]] if r["error_type"] else []
+            active_error_types = [r["error_type"]] if current_failure and r["error_type"] else []
             error_details = []
             source = _model_source(snapshot)
             future_source = source
+            fault_history_resolved = False
+            if not current_failure:
+                severity_score = 0
+                severity_label = snapshot.severity_labels.get(0, "Event")
+                severity_tr = snapshot.severity_labels_tr.get(0, severity_label)
 
         items.append({
             "robot_id": robot_id,
@@ -1389,7 +1413,8 @@ def _head_rows(
             "error_type": r["error_type"] or "Unknown",
             "error_detail": r["error_detail"] or "",
             "component": _category_for_error_type(r["error_type"]),
-            "status": _classify_status(r["error_level"], r["hourly_ratio"]),
+            "fault_history_resolved": fault_history_resolved,
+            "status": _classify_status(r["error_level"], r["hourly_ratio"]) if current_failure else "Normal",
             "active_error_types": active_error_types,
             "error_details": error_details,
             "head_1": {
@@ -2095,6 +2120,7 @@ body.dark .mono-id{background:#172238;color:var(--text)}
 .pred-card .label-sm{font-size:11px;color:var(--text-mute);text-transform:uppercase;letter-spacing:.04em}
 .pred-card .issue{font-weight:600;font-size:13px}
 .pred-card .time{font-size:12.5px;color:var(--text)}
+.pred-card .resolved-model-note{font-size:11px;color:#b45309;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:4px 8px;cursor:default}
 .pred-card .btn-view{background:#fff;color:var(--primary);border:1px solid var(--primary);
   padding:6px 10px;border-radius:8px;font-weight:600;font-size:12.5px;width:100%;cursor:pointer}
 .pred-card .btn-view:hover{background:var(--primary);color:#fff}
@@ -2563,6 +2589,8 @@ const I18N = {
     topFailurePred: "Robot-Level Head Outputs",
     legendActual:"Actual", legendPredicted:"Predicted", predictedFailure:"Predicted Failure",
     riskCritical:"Critical Risk", riskHigh:"High Risk", riskMedium:"Medium Risk", riskLow:"Low Risk",
+    resolvedModelNote:"Fault History resolved — model still detects active risk",
+    resolvedModelNoteTooltip:"Fault History shows this fault as resolved, but the model is still detecting active risk patterns. The model signal may indicate a re-occurrence or a pattern not yet reflected in the fault log.",
     allRobots:"All Robots", allComponents:"All Components", allStatuses:"All Statuses", allFaultTypes:"All Fault Types",
     last7Days:"Last 7 Days", last30Days:"Last 30 Days", last90Days:"Last 90 Days",
     totalFaults:"Total Faults", ofNRobots:"of {0} total robots",
@@ -2624,6 +2652,8 @@ const I18N = {
     topFailurePred: "Robot Bazlı Head Çıktıları",
     legendActual:"Gerçek", legendPredicted:"Tahmin", predictedFailure:"Tahmin Edilen Arıza",
     riskCritical:"Kritik Risk", riskHigh:"Yüksek Risk", riskMedium:"Orta Risk", riskLow:"Düşük Risk",
+    resolvedModelNote:"Geçmiş çözüldü — model hâlâ aktif risk tespit ediyor",
+    resolvedModelNoteTooltip:"Arıza Geçmişi bu hatayı çözüldü olarak gösteriyor, ancak model hâlâ aktif risk örüntüleri tespit ediyor. Bu sinyal, arızanın yeniden ortaya çıktığına veya henüz geçmişe yansımayan bir örüntüye işaret ediyor olabilir.",
     allRobots:"Tüm Robotlar", allComponents:"Tüm Bileşenler", allStatuses:"Tüm Durumlar", allFaultTypes:"Tüm Arıza Tipleri",
     last7Days:"Son 7 Gün", last30Days:"Son 30 Gün", last90Days:"Son 90 Gün",
     totalFaults:"Toplam Arıza", ofNRobots:"toplam {0} robottan",
@@ -3601,6 +3631,10 @@ function renderTopFailureCard(it){
   const riskLabel = t("risk" + rk) || it.risk_level;
   const value = it.value == null ? "—" : `${it.value}${it.unit === "%" ? "%" : " " + it.unit}`;
   const estimate = it.estimated_time_label || formatLong(it.estimated_time);
+  const resolvedTooltip = t("resolvedModelNoteTooltip") || "Fault History shows this fault as resolved, but the model is still detecting active risk patterns. The model signal may indicate a re-occurrence or a pattern not yet reflected in the fault log.";
+  const resolvedWarning = (it.fault_history_resolved && rk === "Critical" && it.head === "1")
+    ? `<div class="resolved-model-note" title="${escapeAttr(resolvedTooltip)}">⚠ ${escapeHtml(t("resolvedModelNote") || "Fault History resolved — model still detects active risk")}</div>`
+    : "";
   return `
     <div class="pred-card ${rk}">
       <div class="head">
@@ -3614,6 +3648,7 @@ function renderTopFailureCard(it){
         <span class="prob" style="color:${rk==='Critical'?'var(--red)':rk==='High'?'var(--amber)':rk==='Medium'?'#a16207':'var(--green)'}">${escapeHtml(value)}</span>
         <span class="risk-pill ${rk}">${escapeHtml(riskLabel)}</span>
       </div>
+      ${resolvedWarning}
       <div><div class="label-sm">${escapeHtml(it.value_label || t("failureProb"))}</div></div>
       <div><div class="label-sm">${t("predictedIssue")}</div><div class="issue">${escapeHtml(it.predicted_issue)}</div></div>
       <div><div class="label-sm">${t("estimatedTime")}</div><div class="time">${escapeHtml(estimate)}</div></div>
