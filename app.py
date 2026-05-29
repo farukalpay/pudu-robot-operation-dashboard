@@ -280,6 +280,39 @@ def _failure_condition_sql(column: str = "error_level") -> tuple[str, list[str]]
     return f"COALESCE({column}, '') IN ({placeholders})", levels
 
 
+def _severity_score_case_sql(column: str = "error_level") -> tuple[str, list[Any]]:
+    severity_map = MODEL_RUNTIME.snapshot().severity_map
+    if not severity_map:
+        return "NULL", []
+    clauses: list[str] = []
+    params: list[Any] = []
+    for level, score in severity_map.items():
+        clauses.append(f"WHEN COALESCE({column}, '') = %s THEN %s")
+        params.extend([level, int(score)])
+    return f"CASE {' '.join(clauses)} ELSE NULL END", params
+
+
+def _heatmap_risk_score(hourly_ratio: float | None, severity_score: int | None) -> float:
+    """Convert model severity + observed ratio into the 0-100 heatmap scale."""
+    ratio_score = max(0.0, min(100.0, float(hourly_ratio or 0) * 100))
+    severity_floor = 0.0
+    if severity_score is not None:
+        if severity_score >= 3:
+            severity_floor = 75.0
+        elif severity_score == 2:
+            severity_floor = 55.0
+        elif severity_score == 1:
+            severity_floor = 30.0
+    return round(max(ratio_score, severity_floor), 1)
+
+
+def _head_heatmap_risk_score(item: dict[str, Any]) -> float:
+    severity_score = item["head_2"]["severity_score"]
+    failure_ratio = (item["head_1"]["failure_prob_now"] or 0) / 100
+    future_score = float(item["head_3"]["next_7d_fail_prob"] or 0)
+    return round(max(_heatmap_risk_score(failure_ratio, severity_score), future_score), 1)
+
+
 def _category_order_from_types(error_types: list[str | None]) -> list[str]:
     categories = {_category_for_error_type(error_type) for error_type in error_types}
     return sorted(categories)
@@ -341,6 +374,10 @@ def _bucket_keys(start: datetime, end: datetime, grain: str) -> list[datetime]:
         keys.append(cursor)
         cursor += step
     return keys
+
+
+def _bucket_datetime(value: Any) -> datetime:
+    return datetime(value.year, value.month, value.day)
 
 # ============================================================================
 # API: shared
@@ -768,22 +805,26 @@ def api_pred_heatmap(
         horizon_hours = _prediction_horizon_hours(snapshot, horizon_days)
         robot = robot_id if robot_id and robot_id.lower() not in ("", "all", "all robots") else None
 
-        # When the live engine is available, use its ranking to pick the top-N
-        # robots; otherwise the fallback _head_reference_rows query does the
-        # same. Either way we always run the bucketed historical risk query
-        # below so the grid has visible columns.
+        # Use the same model-head rows as the KPI cards to choose the heatmap
+        # robots. Otherwise fallback mode can pick alphabetic robots with no
+        # recent risk while the "High Severity Robots" KPI is non-zero.
         chosen_robot_ids: list[str] = []
-        if snapshot.engine_available:
-            items, _meta = _head_rows(cur, None, None, horizon_hours, robot)
-            if items:
-                ranked = items if robot else sorted(
-                    items,
-                    key=lambda item: (
-                        -(item["head_3"]["next_7d_fail_prob"] or 0),
-                        item["robot_id"],
-                    ),
-                )
-                chosen_robot_ids = [item["robot_id"] for item in ranked][:8 if not robot else None]
+        items, _meta = _head_rows(cur, None, None, horizon_hours, robot)
+        head_risk_by_robot = {item["robot_id"]: _head_heatmap_risk_score(item) for item in items}
+        if items:
+            ranked = items if robot else sorted(
+                items,
+                key=lambda item: (
+                    not item["head_1"]["is_failure_now"],
+                    -(item["head_2"]["severity_score"] if item["head_2"]["severity_score"] is not None else -1),
+                    -(item["head_1"]["failure_prob_now"] or 0),
+                    not item["head_3"]["future_failure_observed"],
+                    -(item["head_3"]["next_7d_fail_prob"] or 0),
+                    item["head_4"]["est_hours_to_failure"] if item["head_4"]["est_hours_to_failure"] is not None else 10**9,
+                    item["robot_id"],
+                ),
+            )
+            chosen_robot_ids = [item["robot_id"] for item in ranked][:8 if not robot else None]
 
         reference_rows, _start, reference = _head_reference_rows(cur, None, None, horizon_hours, robot)
         robot_ids = [r["robot_id"] for r in reference_rows if r["robot_id"]]
@@ -802,13 +843,15 @@ def api_pred_heatmap(
         observed_start = reference - timedelta(hours=horizon_hours)
         grain = "day" if horizon_hours <= 14 * 24 else "week"
         failure_sql, failure_params = _failure_condition_sql("error_level")
+        severity_sql, severity_params = _severity_score_case_sql("error_level")
         placeholders = ",".join(["%s"] * len(robot_ids))
         cur.execute(
             f"""
             SELECT robot_id,
                    date_trunc('{grain}', task_time) AS bkt,
                    COUNT(*) AS events,
-                   MAX(hourly_ratio) AS risk
+                   MAX(hourly_ratio) AS risk_ratio,
+                   MAX({severity_sql}) AS severity_score
             FROM public.robot_logs_error
             WHERE task_time >= %s
               AND task_time <= %s
@@ -817,15 +860,20 @@ def api_pred_heatmap(
             GROUP BY robot_id, bkt
             ORDER BY robot_id, bkt;
             """,
-            [observed_start, reference, *robot_ids, *failure_params],
+            [*severity_params, observed_start, reference, *robot_ids, *failure_params],
         )
         rows = cur.fetchall()
         bucket_keys = _bucket_keys(observed_start, reference, grain)
         robots: dict[str, dict[datetime, float]] = {rid: {b: 0.0 for b in bucket_keys} for rid in robot_ids}
         for r in rows:
-            bucket = r["bkt"]
+            bucket = _bucket_datetime(r["bkt"])
             if bucket in robots.get(r["robot_id"], {}):
-                robots[r["robot_id"]][bucket] = round(float(r["risk"] or 0) * 100, 1)
+                robots[r["robot_id"]][bucket] = _heatmap_risk_score(r["risk_ratio"], r["severity_score"])
+        if bucket_keys:
+            current_bucket = bucket_keys[-1]
+            for rid, model_risk in head_risk_by_robot.items():
+                if rid in robots:
+                    robots[rid][current_bucket] = max(robots[rid][current_bucket], model_risk)
         bucket_labels = [bucket.strftime("%b %d") for bucket in bucket_keys]
         if robot:
             active_robots = [(rid, robots[rid]) for rid in robot_ids]
