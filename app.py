@@ -1199,6 +1199,8 @@ def api_top_failures(
                 "category": row["component"],
                 "head": selected_head,
                 "source": row[f"head_{selected_head}"]["source"],
+                "fault_history_resolved": row["fault_history_resolved"],
+                "model_active_risk": row["head_1"]["is_failure_now"],
                 "_sort": sort_key,
             })
         items.sort(key=lambda x: x["_sort"])
@@ -2120,7 +2122,7 @@ body.dark .mono-id{background:#172238;color:var(--text)}
 .pred-card .label-sm{font-size:11px;color:var(--text-mute);text-transform:uppercase;letter-spacing:.04em}
 .pred-card .issue{font-weight:600;font-size:13px}
 .pred-card .time{font-size:12.5px;color:var(--text)}
-.pred-card .resolved-model-note{font-size:11px;color:#b45309;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:4px 8px;cursor:default}
+.pred-card .resolved-model-note{font-size:11px;color:#b45309;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:4px 8px;cursor:help}
 .pred-card .btn-view{background:#fff;color:var(--primary);border:1px solid var(--primary);
   padding:6px 10px;border-radius:8px;font-weight:600;font-size:12.5px;width:100%;cursor:pointer}
 .pred-card .btn-view:hover{background:var(--primary);color:#fff}
@@ -2589,8 +2591,8 @@ const I18N = {
     topFailurePred: "Robot-Level Head Outputs",
     legendActual:"Actual", legendPredicted:"Predicted", predictedFailure:"Predicted Failure",
     riskCritical:"Critical Risk", riskHigh:"High Risk", riskMedium:"Medium Risk", riskLow:"Low Risk",
-    resolvedModelNote:"Fault History resolved — model still detects active risk",
-    resolvedModelNoteTooltip:"Fault History shows this fault as resolved, but the model is still detecting active risk patterns. The model signal may indicate a re-occurrence or a pattern not yet reflected in the fault log.",
+    resolvedModelNote:"Fault History resolved, but model detects active risk",
+    resolvedModelNoteTooltip:"Fault History says this fault is resolved, but the model detects active risk in the current pattern. The model signal may indicate a re-occurrence or a pattern not yet reflected in the fault log.",
     allRobots:"All Robots", allComponents:"All Components", allStatuses:"All Statuses", allFaultTypes:"All Fault Types",
     last7Days:"Last 7 Days", last30Days:"Last 30 Days", last90Days:"Last 90 Days",
     totalFaults:"Total Faults", ofNRobots:"of {0} total robots",
@@ -2652,8 +2654,8 @@ const I18N = {
     topFailurePred: "Robot Bazlı Head Çıktıları",
     legendActual:"Gerçek", legendPredicted:"Tahmin", predictedFailure:"Tahmin Edilen Arıza",
     riskCritical:"Kritik Risk", riskHigh:"Yüksek Risk", riskMedium:"Orta Risk", riskLow:"Düşük Risk",
-    resolvedModelNote:"Geçmiş çözüldü — model hâlâ aktif risk tespit ediyor",
-    resolvedModelNoteTooltip:"Arıza Geçmişi bu hatayı çözüldü olarak gösteriyor, ancak model hâlâ aktif risk örüntüleri tespit ediyor. Bu sinyal, arızanın yeniden ortaya çıktığına veya henüz geçmişe yansımayan bir örüntüye işaret ediyor olabilir.",
+    resolvedModelNote:"Fault History resolved, fakat model aktif risk tespit ediyor",
+    resolvedModelNoteTooltip:"Fault History resolved, fakat model mevcut pattern'da aktif risk tespit ediyor. Bu sinyal, arızanın yeniden ortaya çıktığına veya henüz geçmişe yansımayan bir örüntüye işaret ediyor olabilir.",
     allRobots:"Tüm Robotlar", allComponents:"Tüm Bileşenler", allStatuses:"Tüm Durumlar", allFaultTypes:"Tüm Arıza Tipleri",
     last7Days:"Son 7 Gün", last30Days:"Son 30 Gün", last90Days:"Son 90 Gün",
     totalFaults:"Toplam Arıza", ofNRobots:"toplam {0} robottan",
@@ -3631,9 +3633,9 @@ function renderTopFailureCard(it){
   const riskLabel = t("risk" + rk) || it.risk_level;
   const value = it.value == null ? "—" : `${it.value}${it.unit === "%" ? "%" : " " + it.unit}`;
   const estimate = it.estimated_time_label || formatLong(it.estimated_time);
-  const resolvedTooltip = t("resolvedModelNoteTooltip") || "Fault History shows this fault as resolved, but the model is still detecting active risk patterns. The model signal may indicate a re-occurrence or a pattern not yet reflected in the fault log.";
-  const resolvedWarning = (it.fault_history_resolved && rk === "Critical" && it.head === "1")
-    ? `<div class="resolved-model-note" title="${escapeAttr(resolvedTooltip)}">⚠ ${escapeHtml(t("resolvedModelNote") || "Fault History resolved — model still detects active risk")}</div>`
+  const resolvedTooltip = t("resolvedModelNoteTooltip") || "Fault History says this fault is resolved, but the model detects active risk in the current pattern. The model signal may indicate a re-occurrence or a pattern not yet reflected in the fault log.";
+  const resolvedWarning = (it.fault_history_resolved && it.model_active_risk)
+    ? `<div class="resolved-model-note" tabindex="0" title="${escapeAttr(resolvedTooltip)}" aria-label="${escapeAttr(resolvedTooltip)}">⚠ ${escapeHtml(t("resolvedModelNote") || "Fault History resolved, but model detects active risk")}</div>`
     : "";
   return `
     <div class="pred-card ${rk}">
