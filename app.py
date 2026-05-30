@@ -1190,6 +1190,13 @@ def api_top_failures(
                 "value": value,
                 "unit": unit,
                 "value_label": value_label,
+                # Head 2 sends the severity word in both languages so the
+                # client can render "Event / Warning / Error / Fatal" in the
+                # right-hand pill on the card without needing to know the
+                # severity_score scale.
+                "severity_now": row["head_2"]["severity_now"],
+                "severity_now_tr": row["head_2"]["severity_now_tr"],
+                "severity_score": severity_score,
                 "failure_probability": value if unit == "%" else None,
                 "risk_level": risk,
                 "predicted_issue": row["error_type"],
@@ -2112,7 +2119,11 @@ body.dark .mono-id{background:#172238;color:var(--text)}
   display:grid;place-items:center;color:#475569}
 .pred-card .head .id{font-weight:700;font-size:13.5px}
 .pred-card .head .area{font-size:11px;color:var(--text-mute)}
-.pred-card .prob-row{display:flex;align-items:center;justify-content:space-between}
+.pred-card .prob-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+/* Head 2 swaps a long word ("High Risk", "Critical Risk") into the .prob
+   slot. Shrink the font a touch so it doesn't run into the severity pill
+   on the right side of the card. */
+.pred-card .prob.prob-text{font-size:17px;line-height:1.2;word-break:keep-all}
 .pred-card .prob{font-size:22px;font-weight:700}
 .pred-card .risk-pill{font-size:11px;padding:3px 8px;border-radius:999px;font-weight:600}
 .pred-card .risk-pill.Critical{background:var(--red-soft);color:#b91c1c}
@@ -3637,6 +3648,21 @@ function renderTopFailureCard(it){
   const resolvedWarning = (it.fault_history_resolved && it.model_active_risk)
     ? `<div class="resolved-model-note" tabindex="0" title="${escapeAttr(resolvedTooltip)}" aria-label="${escapeAttr(resolvedTooltip)}">⚠ ${escapeHtml(t("resolvedModelNote") || "Fault History resolved, but model detects active risk")}</div>`
     : "";
+
+  // Head 2 (Fault Severity) layout swap:
+  //   LEFT = the risk word ("High Risk" etc) as the big, attention-grabbing
+  //          headline (replaces the old "2/3" number).
+  //   RIGHT = a pill showing the actual severity name (Event / Warning /
+  //           Error / Fatal) instead of the meaningless "2/3" fraction.
+  // Other heads keep numeric-on-left + risk-pill-on-right.
+  const isHead2 = it.head === "2" || it.unit === "/3";
+  const leftHtml = isHead2
+    ? `<span class="prob prob-text" style="color:${rk==='Critical'?'var(--red)':rk==='High'?'var(--amber)':rk==='Medium'?'#a16207':'var(--green)'}">${escapeHtml(riskLabel)}</span>`
+    : `<span class="prob" style="color:${rk==='Critical'?'var(--red)':rk==='High'?'var(--amber)':rk==='Medium'?'#a16207':'var(--green)'}">${escapeHtml(value)}</span>`;
+  const rightHtml = isHead2
+    ? `<span class="risk-pill ${rk}">${escapeHtml(currentLang === "tr" ? (it.severity_now_tr || it.value_label || "—") : (it.severity_now || it.value_label || "—"))}</span>`
+    : `<span class="risk-pill ${rk}">${escapeHtml(riskLabel)}</span>`;
+
   return `
     <div class="pred-card ${rk}">
       <div class="head">
@@ -3647,8 +3673,8 @@ function renderTopFailureCard(it){
         </div>
       </div>
       <div class="prob-row">
-        <span class="prob" style="color:${rk==='Critical'?'var(--red)':rk==='High'?'var(--amber)':rk==='Medium'?'#a16207':'var(--green)'}">${escapeHtml(value)}</span>
-        <span class="risk-pill ${rk}">${escapeHtml(riskLabel)}</span>
+        ${leftHtml}
+        ${rightHtml}
       </div>
       ${resolvedWarning}
       <div><div class="label-sm">${escapeHtml(it.value_label || t("failureProb"))}</div></div>
