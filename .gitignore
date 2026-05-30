@@ -14,6 +14,8 @@ Thumbs.db
 
 # Logs
 *.log
+.assistant_data/
+assistant_chat.sqlite3
 
 # Local secrets
 .env
