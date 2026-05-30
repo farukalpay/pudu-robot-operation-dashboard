@@ -731,44 +731,81 @@ def api_fault_list(
     robot: str | None = None,
     fault_type: str | None = None,
     status: str | None = None,
+    resolution: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict[str, Any]:
     with get_cursor() as cur:
         win_start, win_end = _data_window(cur)
-        sql = """
-            SELECT robot_id, error_id, error_type, error_detail, error_level, hourly_ratio, task_time,
-                   hourly_error_count, pair_max_hourly_count
-            FROM public.robot_logs_error
-            WHERE task_time BETWEEN %s AND %s
-        """
+        # Build WHERE clauses + params shared between the COUNT and SELECT
+        # queries. The new resolution filter is enforced in SQL via the
+        # severity / failure case + a 30-day age check, so every page
+        # walks the full ~147k-row table instead of the old in-memory
+        # LIMIT 5000 slice.
+        severity_sql, severity_params = _severity_score_case_sql("error_level")
+        failure_sql, failure_params = _failure_condition_sql("error_level")
+        # In Progress (= unresolved) iff: classified as Critical AND newer
+        # than 30 days from the data extent's end.
+        critical_pred = f"(({severity_sql}) >= 2 OR ({failure_sql}))"
+        in_progress_pred = f"({critical_pred} AND task_time > (%s::timestamp - INTERVAL '30 days'))"
+
+        where: list[str] = ["task_time BETWEEN %s AND %s"]
         params: list[Any] = [win_start, win_end]
         if start_date:
             try:
                 d = datetime.fromisoformat(start_date)
                 if d.tzinfo is not None: d = d.replace(tzinfo=None)
-                sql += " AND task_time >= %s"; params.append(d)
+                where.append("task_time >= %s"); params.append(d)
             except ValueError:
                 pass
         if end_date:
             try:
                 d = datetime.fromisoformat(end_date) + timedelta(days=1)
                 if d.tzinfo is not None: d = d.replace(tzinfo=None)
-                sql += " AND task_time < %s"; params.append(d)
+                where.append("task_time < %s"); params.append(d)
             except ValueError:
                 pass
         if search:
-            # The search box now reads "Search Error ID..." and filters
-            # against error_id only.
-            sql += " AND COALESCE(error_id,'') ILIKE %s"
+            # Placeholder reads "Search Error ID...".
+            where.append("COALESCE(error_id,'') ILIKE %s")
             params.append(f"%{search}%")
         if robot and robot.lower() not in ("all", "all robots"):
-            sql += " AND robot_id = %s"; params.append(robot)
+            where.append("robot_id = %s"); params.append(robot)
         if fault_type and fault_type.lower() not in ("all", "all fault types"):
-            sql += " AND error_type = %s"; params.append(fault_type)
+            where.append("error_type = %s"); params.append(fault_type)
 
-        sql += " ORDER BY task_time DESC LIMIT 5000;"
-        cur.execute(sql, params)
+        resolution_filter_params: list[Any] = []
+        normalised_resolution = (resolution or "").strip().lower()
+        if normalised_resolution == "in progress":
+            # Need the severity case params, the failure-condition params,
+            # AND the win_end timestamp used in the age check.
+            where.append(in_progress_pred)
+            resolution_filter_params += [*severity_params, *failure_params, win_end]
+        elif normalised_resolution == "resolved":
+            where.append(f"NOT {in_progress_pred}")
+            resolution_filter_params += [*severity_params, *failure_params, win_end]
+
+        where_sql = " AND ".join(where)
+
+        # Total count
+        count_sql = f"SELECT COUNT(*) AS n FROM public.robot_logs_error WHERE {where_sql};"
+        cur.execute(count_sql, [*params, *resolution_filter_params])
+        total = int(cur.fetchone()["n"] or 0)
+
+        # Page slice — straight SQL OFFSET / LIMIT so we never load all 147k
+        # rows into Python.
+        offset = (page - 1) * page_size
+        cur.execute(
+            f"""
+            SELECT robot_id, error_id, error_type, error_detail, error_level, hourly_ratio, task_time,
+                   hourly_error_count, pair_max_hourly_count
+            FROM public.robot_logs_error
+            WHERE {where_sql}
+            ORDER BY task_time DESC, ingest_id DESC
+            LIMIT %s OFFSET %s;
+            """,
+            [*params, *resolution_filter_params, page_size, offset],
+        )
         rows = cur.fetchall()
 
         items = []
@@ -779,7 +816,7 @@ def api_fault_list(
             mins = int((r["hourly_error_count"] or 1) * 8)
             downtime = f"{mins // 60}h {mins % 60:02d}m" if mins >= 60 else f"{mins}m"
             tt = r["task_time"]
-            resolution = "In Progress" if _is_unresolved_fault(r["error_level"], r["hourly_ratio"], tt, win_end) else "Resolved"
+            res = "In Progress" if _is_unresolved_fault(r["error_level"], r["hourly_ratio"], tt, win_end) else "Resolved"
             items.append({
                 "task_time": r["task_time"].isoformat() if r["task_time"] else None,
                 "robot_id": r["robot_id"] or "",
@@ -788,13 +825,11 @@ def api_fault_list(
                 "category": _category_for_error_type(r["error_type"]),
                 "diagnosed_issue": r["error_detail"] or r["error_type"] or "Unknown issue",
                 "downtime": downtime,
-                "resolution": resolution,
+                "resolution": res,
                 "status": st,
             })
 
-        total = len(items)
-        start_idx = (page - 1) * page_size
-        return {"total": total, "page": page, "page_size": page_size, "items": items[start_idx:start_idx + page_size]}
+        return {"total": total, "page": page, "page_size": page_size, "items": items}
 
 
 # ============================================================================
@@ -884,11 +919,11 @@ def api_pred_heatmap(
             bucket = _bucket_datetime(r["bkt"])
             if bucket in robots.get(r["robot_id"], {}):
                 robots[r["robot_id"]][bucket] = _heatmap_risk_score(r["risk_ratio"], r["severity_score"])
-        if bucket_keys:
-            current_bucket = bucket_keys[-1]
-            for rid, model_risk in head_risk_by_robot.items():
-                if rid in robots:
-                    robots[rid][current_bucket] = max(robots[rid][current_bucket], model_risk)
+        # Note: previously, the final bucket (eg Feb 26) was overwritten with
+        # the LSTM head_3 7-day forecast for each robot, which made that
+        # column visually different from the others — the user reported it
+        # as "weekly aggregation". Heatmap now uses purely historical risk
+        # per day so the final column reads the same way as every other.
         bucket_labels = [bucket.strftime("%b %d") for bucket in bucket_keys]
         if robot:
             active_robots = [(rid, robots[rid]) for rid in robot_ids]
@@ -2366,6 +2401,11 @@ body.dark .heatmap-tooltip{background:#020617}
         </div>
         <select class="select" id="fhRobotFilter"></select>
         <select class="select" id="fhFaultFilter"></select>
+        <select class="select" id="fhResolutionFilter">
+          <option value="">All Resolution</option>
+          <option value="Resolved">Resolved</option>
+          <option value="In Progress">In Progress</option>
+        </select>
         <input class="input-date" type="date" id="fhStartDate" />
         <span class="arrow">→</span>
         <input class="input-date" type="date" id="fhEndDate" />
@@ -2815,7 +2855,7 @@ function canonicalCategory(label){
 // Reverse lookup the canonical category code for a possibly-translated label.
 const state = {
   page:1, pageSize:5, search:"", status:"All Statuses", faultType:"All Fault Types",
-  fh:{page:1, pageSize:8, search:"", robot:"All Robots", fault_type:"All Fault Types", status:"All Statuses", start_date:"", end_date:""},
+  fh:{page:1, pageSize:8, search:"", robot:"All Robots", fault_type:"All Fault Types", status:"All Statuses", resolution:"", start_date:"", end_date:""},
   pred:{category:"", robot:"All Robots", windowDays:7, head:"1", heads:null, topVisible:5, topFailureItems:[]},
   // global date filter shared across dashboard/predictions/fault-history
   range:{ start:"", end:"", extentStart:"", extentEnd:"" },
@@ -3147,6 +3187,9 @@ function bindFaultHistoryUI(){
   document.getElementById("fhFaultFilter").addEventListener("change", e=>{
     state.fh.fault_type = e.target.value; state.fh.page = 1; loadFhList();
   });
+  document.getElementById("fhResolutionFilter").addEventListener("change", e=>{
+    state.fh.resolution = e.target.value; state.fh.page = 1; loadFhList();
+  });
   const startEl = document.getElementById("fhStartDate");
   const endEl   = document.getElementById("fhEndDate");
   startEl.addEventListener("change", e=>{
@@ -3170,10 +3213,11 @@ function bindFaultHistoryUI(){
 }
 
 function clearFhFilters(){
-  state.fh = {page:1, pageSize:8, search:"", robot:"", fault_type:"", status:"", start_date:"", end_date:""};
+  state.fh = {page:1, pageSize:8, search:"", robot:"", fault_type:"", status:"", resolution:"", start_date:"", end_date:""};
   document.getElementById("fhSearch").value = "";
   document.getElementById("fhRobotFilter").value = "";
   document.getElementById("fhFaultFilter").value = "";
+  document.getElementById("fhResolutionFilter").value = "";
   const sd = document.getElementById("fhStartDate");
   const ed = document.getElementById("fhEndDate");
   sd.value = ""; sd.removeAttribute("max");
@@ -3225,6 +3269,7 @@ async function loadFhList(){
   if (state.fh.robot) p.set("robot", state.fh.robot);
   if (state.fh.fault_type) p.set("fault_type", state.fh.fault_type);
   if (state.fh.status) p.set("status", state.fh.status);
+  if (state.fh.resolution) p.set("resolution", state.fh.resolution);
   if (state.fh.start_date) p.set("start_date", state.fh.start_date);
   if (state.fh.end_date) p.set("end_date", state.fh.end_date);
   try{
