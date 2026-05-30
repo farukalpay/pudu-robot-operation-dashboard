@@ -1684,7 +1684,12 @@ a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
 .user-caret{color:var(--sidebar-fg-mute)}
 
 	.main{flex:1;padding:24px 28px 32px;min-width:0;max-width:100%;overflow-x:hidden}
-	.runtime-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:18px}
+	/* Runtime metadata strip (MODEL REPO / COMMIT / ARTIFACTS / SOURCE)
+	   was pinned to the top of every page. Operators don't need it in
+	   the regular view, so it's hidden by default. Add `runtime-strip-show`
+	   to the <body> if you ever want it back. */
+	.runtime-strip{display:none;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:18px}
+	body.runtime-strip-show .runtime-strip{display:grid}
 	.runtime-strip:empty{display:none}
 	.runtime-item{background:#fff;border:1px solid var(--border);border-radius:8px;padding:10px 12px;min-width:0}
 	.runtime-item .k{font-size:10.5px;color:var(--text-mute);text-transform:uppercase;letter-spacing:.04em;font-weight:700}
@@ -3031,15 +3036,24 @@ function asOptions(items){
     return `<option value="${escapeAttr(v)}">${escapeHtml(s)}</option>`;
   }).join("");
 }
+// Robot variant: the option VALUE keeps the full serial (so the backend can
+// match exactly) but the visible TEXT uses shortenId() so the dropdown reads
+// like the heatmap labels (RC-XXXXXXXX) instead of a wall of 15-char strings.
+function asRobotOptions(items){
+  return items.map((s,i)=>{
+    if (i === 0) return `<option value="">${escapeHtml(s)}</option>`;
+    return `<option value="${escapeAttr(s)}" title="${escapeAttr(s)}">${escapeHtml(shortenId(s))}</option>`;
+  }).join("");
+}
 async function loadFilterOptions(){
   if (filterOptionsLoaded){ applyLanguage(currentLang); return; }
   try{
     const d = await fetchJson("/api/filter-options");
     document.getElementById("statusFilter").innerHTML    = asOptions(d.robot_statuses);
     document.getElementById("faultFilter").innerHTML     = asOptions(d.fault_types);
-    document.getElementById("fhRobotFilter").innerHTML   = asOptions(d.robots);
+    document.getElementById("fhRobotFilter").innerHTML   = asRobotOptions(d.robots);
     document.getElementById("fhFaultFilter").innerHTML   = asOptions(d.fault_types);
-    document.getElementById("predRobotFilter").innerHTML = asOptions(d.robots);
+    document.getElementById("predRobotFilter").innerHTML = asRobotOptions(d.robots);
     document.getElementById("predCategoryFilter").innerHTML = asOptions(d.categories);
     document.getElementById("degrCategoryFilter").innerHTML = asOptions(d.categories);
     filterOptionsLoaded = true;
